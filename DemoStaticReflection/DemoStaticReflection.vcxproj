@@ -19,15 +19,11 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup>
-    <ConfigurationType>A</ConfigurationType>
+    <ConfigurationType>Application</ConfigurationType>
     <IncludePath>$(Usagi_IncludePaths);$(IncludePath)</IncludePath>
     <LibraryPath>$(Usagi_LibraryPaths);$(LibraryPath)</LibraryPath>
+    <ExternalIncludeDirectories>$(ProjectDir);$(ExternalIncludeDirectories)</ExternalIncludeDirectories>
   </PropertyGroup>
-  <ItemDefinitionGroup>
-    <ClCompile>
-      <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-    </ClCompile>
-  </ItemDefinitionGroup>
   <ImportGroup Label="ExtensionSettings">
   </ImportGroup>
   <ImportGroup Label="Shared">
@@ -58,4 +54,3 @@
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>
-

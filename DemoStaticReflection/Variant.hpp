@@ -8,9 +8,9 @@
 #include <variant>
 
 #include <boost/mp11.hpp>
-#include <experimental/meta>
 
 #include <Usagi/Library/Reflection/StaticReflection.hpp>
+
 using namespace boost::mp11;
 
 template <typename... Ts>
