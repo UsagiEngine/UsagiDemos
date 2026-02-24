@@ -77,6 +77,11 @@ void SetupCornellBox(RT::ServiceScene & scene)
         { 1.0f, 1.0f, 1.0f },
         { 15.0f, 15.0f, 15.0f },
         0 });
+    // 4: Metal (Slightly rough mirror)
+    scene.materials.push_back({ MaterialType::Metal,
+        { 0.8f, 0.85f, 0.88f },
+        { 0, 0, 0 },
+        0.02f });
 
     // Cornell Box Walls (approximated with large boxes or planes, using Boxes
     // here)
@@ -101,9 +106,9 @@ void SetupCornellBox(RT::ServiceScene & scene)
     // Short box
     scene.boxes.push_back(
         { { -3.0f, -s, 2.0f }, { 0.0f, -s + 3.0f, 5.0f }, 0 });
-    // Tall box
+    // Tall box (Metal)
     scene.boxes.push_back(
-        { { 2.0f, -s, -3.0f }, { 5.0f, -s + 6.0f, 0.0f }, 0 });
+        { { 2.0f, -s, -3.0f }, { 5.0f, -s + 6.0f, 0.0f }, 4 });
 }
 
 int WINAPI WinMain(
@@ -185,7 +190,7 @@ int WINAPI WinMain(
             auto * pixels      = primary_group.get_array<RT::ComponentPixel>();
             pixels[id]         = { x, y };
             // Zero init rng state
-            primary_group.get_array<RT::ComponentPathState>()[id].rng.state = 0;
+            primary_group.get_array<RT::ComponentPathState>()[id].rng.inc = 0;
         }
     }
 

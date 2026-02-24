@@ -76,33 +76,62 @@ typedef Vector3f Normal3f;
 typedef Vector3f Color3f;
 
 /*
- * Shio: Xorshift32 for fast per-pixel random number generation.
+ * Shio: High-quality PCG32 PRNG for per-pixel sampling.
  */
-struct XorShift32
+struct SamplerPCG32
 {
-    uint32_t state;
+    uint64_t state;
+    uint64_t inc;
 
-    void seed(uint32_t s) { state = s ? s : 1'337; }
+    void seed(uint64_t initstate, uint64_t initseq)
+    {
+        state = 0U;
+        inc = (initseq << 1u) | 1u;
+        next_u32();
+        state += initstate;
+        next_u32();
+    }
 
     uint32_t next_u32()
     {
-        uint32_t x = state;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        state = x;
-        return x;
+        uint64_t oldstate = state;
+        state = oldstate * 6364136223846793005ULL + inc;
+        uint32_t xorshifted = static_cast<uint32_t>(((oldstate >> 18u) ^ oldstate) >> 27u);
+        uint32_t rot = static_cast<uint32_t>(oldstate >> 59u);
+        return (xorshifted >> rot) | (xorshifted << ((-rot) & 31));
     }
 
     // Returns float in [0, 1)
-    float next_float() { return (next_u32() & 0xFF'FFFF) / 16777216.0f; }
+    float next_float() { return (next_u32() >> 8) * (1.0f / 16777216.0f); }
 };
+
+struct ONB {
+    Vector3f u, v, w;
+    void build_from_w(const Normal3f& n) {
+        w = n.normalize();
+        Vector3f a = (std::abs(w.x) > 0.9f) ? Vector3f{0, 1, 0} : Vector3f{1, 0, 0};
+        v = w.cross(a).normalize();
+        u = w.cross(v);
+    }
+    Vector3f local(const Vector3f& a) const {
+        return u * a.x + v * a.y + w * a.z;
+    }
+};
+
+inline Vector3f cosine_sample_hemisphere(float u1, float u2) {
+    float r = std::sqrt(u1);
+    float theta = 2.0f * PI * u2;
+    float x = r * std::cos(theta);
+    float y = r * std::sin(theta);
+    float z = std::sqrt(std::max(0.0f, 1.0f - u1));
+    return {x, y, z};
+}
 
 /*
  * Shio: Generates a random point inside the unit sphere.
  * Used for diffuse scattering.
  */
-inline Vector3f random_in_unit_sphere(XorShift32 & rng)
+inline Vector3f random_in_unit_sphere(SamplerPCG32 & rng)
 {
     while(true)
     {
@@ -231,13 +260,13 @@ struct ComponentPixel
  */
 struct ComponentPathState
 {
-    Color3f    throughput;
-    Color3f    radiance;
-    XorShift32 rng;
-    int        depth;
-    bool       active;
-    float      sample_x;
-    float      sample_y;
+    Color3f      throughput;
+    Color3f      radiance;
+    SamplerPCG32 rng;
+    int          depth;
+    bool         active;
+    float        sample_x;
+    float        sample_y;
 };
 
 // -----------------------------------------------------------------------------
@@ -416,9 +445,9 @@ struct SystemGenerateCameraRays
                 auto & state = states[i];
 
                 // Initialize RNG once per pixel
-                if(state.rng.state == 0)
+                if(state.rng.inc == 0)
                 {
-                    state.rng.seed(pixel.y * canvas.width + pixel.x + 1);
+                    state.rng.seed(pixel.y * canvas.width + pixel.x + 1, 1337);
                 }
 
                 // Jitter for anti-aliasing
@@ -506,17 +535,46 @@ struct SystemPathBounce
                         continue;
                     }
 
-                    // Lambertian Scatter
-                    Vector3f target = hit->point + hit->normal + random_in_unit_sphere(state.rng).normalize();
+                    if(mat.type == MaterialType::Metal)
+                    {
+                        Vector3f reflected = ray.direction - hit->normal * 2.0f * ray.direction.dot(hit->normal);
+                        Vector3f target = reflected;
+                        
+                        if(mat.roughness > 0.0f) {
+                            target = target + random_in_unit_sphere(state.rng) * mat.roughness;
+                        }
 
-                    ray.origin    = hit->point;
-                    ray.direction = (target - hit->point).normalize();
-                    ray.t_max     = 1000.0f;
+                        if(target.dot(hit->normal) > 0.0f) {
+                            ray.origin    = hit->point;
+                            ray.direction = target.normalize();
+                            ray.t_max     = 1000.0f;
 
-                    state.throughput = state.throughput * mat.albedo;
-                    state.depth++;
+                            state.throughput = state.throughput * mat.albedo;
+                            state.depth++;
 
-                    local_next.push_back(id);
+                            local_next.push_back(id);
+                        } else {
+                            state.active = false;
+                            film.add_sample(state.sample_x, state.sample_y, state.radiance);
+                        }
+                    }
+                    else
+                    {
+                        // Lambertian Scatter via Cosine-Weighted Hemisphere Sampling
+                        ONB onb;
+                        onb.build_from_w(hit->normal);
+                        Vector3f scatter_dir = onb.local(cosine_sample_hemisphere(state.rng.next_float(), state.rng.next_float()));
+
+                        ray.origin    = hit->point;
+                        ray.direction = scatter_dir.normalize();
+                        ray.t_max     = 1000.0f;
+
+                        // Because PDF = cos(theta) / PI and BRDF = albedo / PI, they cancel out exactly.
+                        state.throughput = state.throughput * mat.albedo;
+                        state.depth++;
+
+                        local_next.push_back(id);
+                    }
                 }
                 else
                 {
