@@ -3,6 +3,7 @@
 #pragma comment(lib, "gdi32.lib")
 
 #include <atomic>
+#include <chrono>
 #include <thread>
 
 #include "Raytracer.hpp"
@@ -179,6 +180,9 @@ int WINAPI WinMain(
                                   .resolve(primary_heap.get_base());
     services.register_service(&gdi_canvas);
 
+    RT::ServiceCamera camera;
+    services.register_service(&camera);
+
     RT::ServiceRenderState render_state;
     services.register_service(&render_state);
 
@@ -237,6 +241,10 @@ int WINAPI WinMain(
 
     // Main Message Loop
     MSG msg = { };
+    auto last_time = std::chrono::high_resolution_clock::now();
+    bool first_mouse = true;
+    POINT last_mouse_pos = {0, 0};
+
     while(true)
     {
         while(PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
@@ -250,6 +258,55 @@ int WINAPI WinMain(
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
+
+        auto current_time = std::chrono::high_resolution_clock::now();
+        float dt = std::chrono::duration<float>(current_time - last_time).count();
+        last_time = current_time;
+
+        bool moved = false;
+
+        // Unreal Editor Style Mouse Look (Hold Right Click)
+        if (GetAsyncKeyState(VK_RBUTTON) & 0x8000) {
+            POINT current_mouse;
+            GetCursorPos(&current_mouse);
+            if (first_mouse) {
+                last_mouse_pos = current_mouse;
+                first_mouse = false;
+            } else {
+                float dx = (current_mouse.x - last_mouse_pos.x) * 0.005f;
+                float dy = (current_mouse.y - last_mouse_pos.y) * 0.005f;
+                
+                if (dx != 0.0f || dy != 0.0f) {
+                    camera.yaw += dx; // Positive dx means looking right (+X)
+                    camera.pitch += dy;
+                    camera.pitch = std::clamp(camera.pitch, -1.5f, 1.5f); // Prevent gimbal lock loops
+                    moved = true;
+                    SetCursorPos(last_mouse_pos.x, last_mouse_pos.y);
+                }
+            }
+        } else {
+            first_mouse = true;
+        }
+
+        // Colemak (WARS physical) Keyboard movement
+        float speed = 10.0f * dt;
+        if (GetAsyncKeyState(VK_SHIFT) & 0x8000) speed *= 3.0f; // Sprint
+
+        RT::Vector3f fwd = camera.forward();
+        RT::Vector3f right = camera.right();
+        RT::Vector3f delta = {0, 0, 0};
+
+        if (GetAsyncKeyState('W') & 0x8000) delta += fwd;
+        if (GetAsyncKeyState('R') & 0x8000) delta -= fwd;
+        if (GetAsyncKeyState('A') & 0x8000) delta -= right;
+        if (GetAsyncKeyState('S') & 0x8000) delta += right;
+        
+        if (delta.x != 0 || delta.y != 0 || delta.z != 0) {
+            camera.position += delta.normalize() * speed;
+            moved = true;
+        }
+
+        if (moved) camera.moved = true;
 
         // Present to Window (Main Thread)
         // We present as fast as the main thread can, or we could limit this.

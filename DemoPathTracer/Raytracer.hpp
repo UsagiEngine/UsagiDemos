@@ -46,6 +46,14 @@ struct Vector3f
         return { x - o.x, y - o.y, z - o.z };
     }
 
+    Vector3f & operator-=(const Vector3f & o)
+    {
+        x -= o.x;
+        y -= o.y;
+        z -= o.z;
+        return *this;
+    }
+
     Vector3f operator*(const Vector3f & o) const
     {
         return { x * o.x, y * o.y, z * o.z };
@@ -372,6 +380,24 @@ struct ServiceGDICanvasProvider
     int              width;
     int              height;
     std::atomic<int> frame_count = 0;
+};
+
+struct ServiceCamera
+{
+    Vector3f position = { 0.0f, 5.0f, -18.0f };
+    float yaw = 0.0f;
+    float pitch = 0.0f;
+    std::atomic<bool> moved = false;
+
+    Vector3f forward() const {
+        return { std::cos(pitch) * std::sin(yaw), -std::sin(pitch), std::cos(pitch) * std::cos(yaw) };
+    }
+    Vector3f right() const {
+        return { std::cos(yaw), 0.0f, -std::sin(yaw) };
+    }
+    Vector3f up() const {
+        return forward().cross(right()).normalize();
+    }
 };
 
 /*
@@ -763,7 +789,7 @@ struct SystemGenerateRays
     using WriteComponent = Usagi::ComponentList<ComponentRay, ComponentPathState, ComponentCameraPath, ComponentLightPath>;
     using ReadComponent  = Usagi::ComponentList<ComponentPixel>;
     using WriteService   = Usagi::ComponentList<ServiceGDICanvasProvider, ServiceRayQueue>;
-    using ReadService    = Usagi::ComponentList<ServiceScheduler, ServiceRenderState, ServiceScene>;
+    using ReadService    = Usagi::ComponentList<ServiceScheduler, ServiceRenderState, ServiceScene, ServiceCamera>;
 
     void update(auto && entities, auto && services)
     {
@@ -774,10 +800,14 @@ struct SystemGenerateRays
         auto & ray_queue = services.template get<ServiceRayQueue>();
         auto & scheduler = services.template get<ServiceScheduler>();
         auto & scene     = services.template get<ServiceScene>();
+        auto & camera    = services.template get<ServiceCamera>();
 
         if (state_svc.pass == 0) canvas.frame_count++;
 
-        Vector3f cam_pos      = { 0.0f, 5.0f, -18.0f }; // Moved back to see full box
+        Vector3f cam_pos      = camera.position;
+        Vector3f cam_fwd      = camera.forward();
+        Vector3f cam_right    = camera.right();
+        Vector3f cam_up       = camera.up();
         float    aspect_ratio = static_cast<float>(canvas.width) / static_cast<float>(canvas.height);
 
         size_t count = entities.size();
@@ -834,7 +864,7 @@ struct SystemGenerateRays
                     float py = 1.0f - 2.0f * v;
 
                     ray.origin    = cam_pos;
-                    ray.direction = Vector3f { px, py, 1.0f }.normalize();
+                    ray.direction = (cam_fwd + cam_right * px + cam_up * py).normalize();
                     ray.t_max     = 1000.0f;
 
                     cpaths[i].count = 0;
@@ -1378,7 +1408,7 @@ struct SystemConnectPaths
 struct SystemPathTracingCoordinator
 {
     using ReadService  = Usagi::ComponentList<>;
-    using WriteService = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler, ServiceRenderState>;
+    using WriteService = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler, ServiceRenderState, ServiceCamera>;
 
     void update(auto && entities, auto && services)
     {
@@ -1392,12 +1422,20 @@ struct SystemPathTracingCoordinator
             auto & scene  = services.template get<ServiceScene>();
             auto & film   = services.template get<ServiceFilm>();
             auto & canvas = services.template get<ServiceGDICanvasProvider>();
+            auto & camera = services.template get<ServiceCamera>();
 
-            // Clear the direct light accumulation buffer fully every frame.
-            // This prevents moving lights from leaving intense 100% white ghost trails,
-            // while EMA decay handles the indirect noisy bounces softly.
-            film.clear_direct();
-            film.apply_ema_decay(0.35); // 0.35 gives ~1 frame of effective memory. Shadows move almost perfectly real-time now!
+            if (camera.moved.exchange(false)) {
+                // Instantly clear ghost trails/history if the camera moves
+                film.clear_direct();
+                film.apply_ema_decay(0.0);
+                canvas.frame_count = 0;
+            } else {
+                // Clear the direct light accumulation buffer fully every frame.
+                // This prevents moving lights from leaving intense 100% white ghost trails,
+                // while EMA decay handles the indirect noisy bounces softly.
+                film.clear_direct();
+                film.apply_ema_decay(0.35); // 0.35 gives ~1 frame of effective memory. Shadows move almost perfectly real-time now!
+            }
 
             // Advance time significantly slower so the sun crawls smoothly across the sky
             float time = canvas.frame_count.load() * 0.005f;
