@@ -197,6 +197,16 @@ struct Sphere
         }
         return root;
     }
+
+    void sample_surface(SamplerPCG32& rng, Vector3f& p, Normal3f& n, float& pdf) const
+    {
+        float z = 1.0f - 2.0f * rng.next_float();
+        float r = std::sqrt(std::max(0.0f, 1.0f - z * z));
+        float phi = 2.0f * PI * rng.next_float();
+        n = { r * std::cos(phi), r * std::sin(phi), z };
+        p = center + n * radius;
+        pdf = 1.0f / (4.0f * PI * radius * radius);
+    }
 };
 
 /*
@@ -392,6 +402,15 @@ struct ServiceFilm
         expY = std::exp(-alpha * ry * ry);
     }
 
+    void clear() {
+        for(auto& p : pixels) {
+            p.r.store(0.0, std::memory_order_relaxed);
+            p.g.store(0.0, std::memory_order_relaxed);
+            p.b.store(0.0, std::memory_order_relaxed);
+            p.weight.store(0.0, std::memory_order_relaxed);
+        }
+    }
+
     float gaussian(float d, float expv) const {
         return std::max(0.0f, std::exp(-alpha * d * d) - expv);
     }
@@ -428,6 +447,25 @@ struct ServiceFilm
             }
         }
     }
+
+    /*
+     * Shio: Exponentially decays the film's accumulated state.
+     * Essential for dynamic real-time path tracing, so moving objects/lights
+     * don't permanently smear across the image buffer over time.
+     */
+    void apply_ema_decay(double decay_factor) {
+        for(auto& p : pixels) {
+            auto atomic_scale = [](std::atomic<double>& target, double factor) {
+                double old = target.load(std::memory_order_relaxed);
+                while(!target.compare_exchange_weak(old, old * factor, std::memory_order_relaxed));
+            };
+            
+            atomic_scale(p.r, decay_factor);
+            atomic_scale(p.g, decay_factor);
+            atomic_scale(p.b, decay_factor);
+            atomic_scale(p.weight, decay_factor);
+        }
+    }
 };
 
 /*
@@ -438,6 +476,62 @@ struct ServiceScene
     std::vector<Sphere>   spheres;
     std::vector<Box>      boxes;
     std::vector<Material> materials;
+    Vector3f              sun_dir = {0, 1, 0};
+
+    Color3f evaluate_sky(const Vector3f& view_dir) const {
+        float cos_theta = view_dir.dot(sun_dir);
+        float rayleigh_phase = 0.75f * (1.0f + cos_theta * cos_theta);
+        
+        float g = 0.98f;
+        float mie_phase = 1.5f * ((1.0f - g*g) / (2.0f + g*g)) * (1.0f + cos_theta*cos_theta) / std::pow(1.0f + g*g - 2.0f*g*cos_theta + 0.001f, 1.5f);
+
+        Vector3f beta_r = {0.0038f, 0.0135f, 0.0331f}; 
+        Vector3f beta_m = {0.0210f, 0.0210f, 0.0210f};
+
+        float v_y = std::max(0.001f, view_dir.y);
+        float s_y = std::max(0.001f, sun_dir.y);
+
+        float opt_depth_v = 1.0f / v_y;
+        float opt_depth_s = 1.0f / s_y;
+
+        // Total scattering coefficient sum
+        Vector3f beta_sum = { beta_r.x + beta_m.x, beta_r.y + beta_m.y, beta_r.z + beta_m.z };
+
+        Vector3f tau = {
+            beta_sum.x * (opt_depth_v + opt_depth_s) * 5.0f,
+            beta_sum.y * (opt_depth_v + opt_depth_s) * 5.0f,
+            beta_sum.z * (opt_depth_v + opt_depth_s) * 5.0f
+        };
+        Vector3f attenuation = { std::exp(-tau.x), std::exp(-tau.y), std::exp(-tau.z) };
+
+        Vector3f scatter = {
+            (beta_r.x * rayleigh_phase + beta_m.x * mie_phase),
+            (beta_r.y * rayleigh_phase + beta_m.y * mie_phase),
+            (beta_r.z * rayleigh_phase + beta_m.z * mie_phase)
+        };
+        
+        // Zero out sky beneath the horizon so we don't see a bright blue floor
+        if (view_dir.y <= 0.0f) return {0,0,0};
+
+        // Proper physically-based in-scattering equation:
+        // L = (Scatter / Beta_sum) * (1 - exp(-tau))
+        Vector3f sky = {
+            (scatter.x / beta_sum.x) * (1.0f - attenuation.x),
+            (scatter.y / beta_sum.y) * (1.0f - attenuation.y),
+            (scatter.z / beta_sum.z) * (1.0f - attenuation.z)
+        };
+        
+        // The sky itself also receives less light as the sun sets, so we must multiply by the sun's raw attenuation!
+        Vector3f sun_tau = { beta_sum.x * opt_depth_s * 5.0f, beta_sum.y * opt_depth_s * 5.0f, beta_sum.z * opt_depth_s * 5.0f };
+        Vector3f sun_attenuation = { std::exp(-sun_tau.x), std::exp(-sun_tau.y), std::exp(-sun_tau.z) };
+        
+        // Add a small ambient floor so night isn't pure #000000
+        sky.x = sky.x * sun_attenuation.x * 20.0f + 0.01f;
+        sky.y = sky.y * sun_attenuation.y * 20.0f + 0.02f;
+        sky.z = sky.z * sun_attenuation.z * 20.0f + 0.05f;
+
+        return sky;
+    }
 
     std::optional<HitRecord> intersect(
         const Vector3f & o, const Vector3f & d, float t_max)
@@ -475,6 +569,13 @@ struct ServiceScene
     }
 
     bool sample_light(SamplerPCG32& rng, Vector3f& p, Normal3f& n, Color3f& emission, float& pdf) const {
+        for (const auto& s : spheres) {
+            if (materials[s.material_index].type == MaterialType::Light) {
+                s.sample_surface(rng, p, n, pdf);
+                emission = materials[s.material_index].emission;
+                return true;
+            }
+        }
         for (const auto& b : boxes) {
             if (materials[b.material_index].type == MaterialType::Light) {
                 b.sample_surface(rng, p, n, pdf);
@@ -487,6 +588,11 @@ struct ServiceScene
 
     float get_light_area() const {
         float area = 0.0f;
+        for (const auto& s : spheres) {
+            if (materials[s.material_index].type == MaterialType::Light) {
+                area += 4.0f * PI * s.radius * s.radius;
+            }
+        }
         for (const auto& b : boxes) {
             if (materials[b.material_index].type == MaterialType::Light) {
                 Vector3f d = b.max - b.min;
@@ -654,7 +760,7 @@ struct SystemIntersectRays
 {
     using ReadComponent  = Usagi::ComponentList<ComponentRay, ComponentPathState>;
     using WriteComponent = Usagi::ComponentList<ComponentRayHit>;
-    using ReadService    = Usagi::ComponentList<ServiceScene>;
+    using ReadService    = Usagi::ComponentList<ServiceScene, ServiceRenderState>;
     using WriteService   = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler, ServiceFilm>;
 
     void update(auto && entities, auto && services)
@@ -663,6 +769,7 @@ struct SystemIntersectRays
         auto & ray_queue = services.template get<ServiceRayQueue>();
         auto & scheduler = services.template get<ServiceScheduler>();
         auto & film      = services.template get<ServiceFilm>();
+        auto & state_svc = services.template get<ServiceRenderState>();
 
         ray_queue.next_rays.clear();
         ray_queue.q_lambert.clear();
@@ -718,10 +825,14 @@ struct SystemIntersectRays
                 }
                 else
                 {
-                    // Background
+                    // Background Sky
                     hit_c.did_hit = false;
                     state.active = false;
-                    film.add_sample(state.sample_x, state.sample_y, state.radiance);
+                    if(state_svc.pass == 1) { // Camera paths
+                        Color3f sky = scene.evaluate_sky(ray.direction);
+                        state.radiance += state.throughput * sky;
+                        film.add_sample(state.sample_x, state.sample_y, state.radiance);
+                    }
                 }
             }
 
@@ -1134,6 +1245,48 @@ struct SystemPathTracingCoordinator
 
         // Start pass
         if (state_svc.pass == 0) {
+            auto & scene  = services.template get<ServiceScene>();
+            auto & film   = services.template get<ServiceFilm>();
+            auto & canvas = services.template get<ServiceGDICanvasProvider>();
+
+            // Apply Exponential Moving Average (EMA) to the film.
+            // 0.50 means only ~2 frames of latency, making the sun look like a discrete moving object
+            // instead of a 20-frame smeared comet beam.
+            film.apply_ema_decay(0.50);
+
+            // Advance time faster so the sun moves noticeably
+            float time = canvas.frame_count.load() * 0.05f;
+            
+            // Sun orbits in YZ plane. Z > 0 is out the back wall.
+            scene.sun_dir = Vector3f{ 0.0f, std::cos(time), std::sin(time) }.normalize();
+            
+            if (!scene.spheres.empty()) {
+                scene.spheres[0].center = scene.sun_dir * 1000.0f;
+                
+                // Color sun emission based on atmosphere
+                float s_y = std::max(0.001f, scene.sun_dir.y);
+                float opt_depth_s = 1.0f / s_y;
+                Vector3f tau = {
+                    0.0038f * opt_depth_s * 5.0f, 
+                    0.0135f * opt_depth_s * 5.0f, 
+                    0.0331f * opt_depth_s * 5.0f
+                };
+                Vector3f attenuation = { std::exp(-tau.x), std::exp(-tau.y), std::exp(-tau.z) };
+                
+                // If the sun dips below the horizon, switch it off entirely.
+                if (scene.sun_dir.y <= 0.0f) {
+                     attenuation = {0.0f, 0.0f, 0.0f};
+                }
+
+                // Multiply base sun color by atmospheric attenuation
+                // Ensure red (x) drops MUCH slower than blue (z)
+                scene.materials[scene.spheres[0].material_index].emission = {
+                    attenuation.x * 2000.0f, // Boosted to act as a proper main light source
+                    attenuation.y * 1000.0f,
+                    attenuation.z *  500.0f
+                };
+            }
+
             SystemGenerateRays sys_gen;
             sys_gen.update(entities, services);
             state_svc.pass = 1;
@@ -1244,15 +1397,17 @@ struct SystemRenderGDICanvas
                 Color3f color = {0, 0, 0};
                 if (weight > 0.0) {
                     double inv_w = 1.0 / weight;
-                    // Because each path tracer pass naturally deposits 1 unit of weight *per frame* over the filter radius,
-                    // dividing the total accumulated color by the *total weight splatted* computes the expectation!
-                    // Dividing by frame count AGAIN darkens the image linearly over time towards 0! We ONLY divide by weight.
                     color.x = static_cast<float>(film.pixels[idx].r.load(std::memory_order_relaxed) * inv_w);
                     color.y = static_cast<float>(film.pixels[idx].g.load(std::memory_order_relaxed) * inv_w);
                     color.z = static_cast<float>(film.pixels[idx].b.load(std::memory_order_relaxed) * inv_w);
                 }
 
                 // Simple Gamma Correction (approximate sqrt)
+                // Also add an exposure tonemapping to handle the bright sky
+                color.x = 1.0f - std::exp(-color.x * 0.1f);
+                color.y = 1.0f - std::exp(-color.y * 0.1f);
+                color.z = 1.0f - std::exp(-color.z * 0.1f);
+
                 float r_f = std::sqrt(color.x);
                 float g_f = std::sqrt(color.y);
                 float b_f = std::sqrt(color.z);

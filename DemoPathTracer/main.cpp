@@ -103,9 +103,8 @@ void SetupCornellBox(RT::ServiceScene & scene)
     // Right Wall (Green)
     scene.boxes.push_back({ { s, -s, -s }, { s + 1.0f, s, s }, 2 });
 
-    // Light (Ceiling patch)
-    float l = 2.0f;
-    scene.boxes.push_back({ { -l, s - 0.1f, -l }, { l, s, l }, 3 });
+    // The Sun (Massive light sphere far away)
+    scene.spheres.push_back({ { 0.0f, 0.0f, 1000.0f }, 50.0f, 3 });
 
     // Boxes inside
     // Short box
