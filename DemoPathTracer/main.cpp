@@ -93,8 +93,8 @@ void SetupCornellBox(RT::ServiceScene & scene)
     scene.boxes.push_back({ { -s, s, -s }, { s, s + 1.0f, s }, 0 });
     // Back Wall (White)
     scene.boxes.push_back({ { -s, -s, s }, { s, s, s + 1.0f }, 0 });
-    // Left Wall (Red)
-    scene.boxes.push_back({ { -s - 1.0f, -s, -s }, { -s, s, s }, 1 });
+    // Left Wall (Metal mirror)
+    scene.boxes.push_back({ { -s - 1.0f, -s, -s }, { -s, s, s }, 4 });
     // Right Wall (Green)
     scene.boxes.push_back({ { s, -s, -s }, { s + 1.0f, s, s }, 2 });
 
@@ -106,9 +106,9 @@ void SetupCornellBox(RT::ServiceScene & scene)
     // Short box
     scene.boxes.push_back(
         { { -3.0f, -s, 2.0f }, { 0.0f, -s + 3.0f, 5.0f }, 0 });
-    // Tall box (Metal)
+    // Tall box (White)
     scene.boxes.push_back(
-        { { 2.0f, -s, -3.0f }, { 5.0f, -s + 6.0f, 0.0f }, 4 });
+        { { 2.0f, -s, -3.0f }, { 5.0f, -s + 6.0f, 0.0f }, 0 });
 }
 
 int WINAPI WinMain(
@@ -156,7 +156,8 @@ int WINAPI WinMain(
     // Note: Added ComponentPathState
     Usagi::ComponentGroup<RT::ComponentPixel,
         RT::ComponentRay,
-        RT::ComponentPathState>
+        RT::ComponentPathState,
+        RT::ComponentRayHit>
         primary_group(primary_heap, PIXEL_COUNT);
 
     // Services setup
@@ -191,6 +192,8 @@ int WINAPI WinMain(
             pixels[id]         = { x, y };
             // Zero init rng state
             primary_group.get_array<RT::ComponentPathState>()[id].rng.inc = 0;
+            // Zero init hit state
+            primary_group.get_array<RT::ComponentRayHit>()[id].did_hit = false;
         }
     }
 
@@ -201,12 +204,12 @@ int WINAPI WinMain(
         Usagi::TaskGraphExecutionHost host(std::thread::hardware_concurrency());
         scheduler.host = &host;
 
-        RT::SystemGenerateCameraRays sys_gen_rays;
-        RT::SystemPathBounce         sys_bounce;
-        RT::SystemRenderGDICanvas    sys_render;
+        RT::SystemGenerateCameraRays     sys_gen_rays;
+        RT::SystemPathTracingCoordinator sys_coord;
+        RT::SystemRenderGDICanvas        sys_render;
 
         host.register_system(sys_gen_rays, primary_group, services);
-        host.register_system(sys_bounce, primary_group, services);
+        host.register_system(sys_coord, primary_group, services);
         host.register_system(sys_render, primary_group, services);
 
         host.build_graph();

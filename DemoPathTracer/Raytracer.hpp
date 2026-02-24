@@ -249,6 +249,12 @@ struct ComponentRay
     float    t_max;
 };
 
+struct ComponentRayHit
+{
+    HitRecord hit;
+    bool      did_hit;
+};
+
 struct ComponentPixel
 {
     int x, y;
@@ -280,8 +286,13 @@ struct ServiceScheduler
 
 struct ServiceRayQueue
 {
-    std::vector<uint32_t> queue;
-    std::vector<uint32_t> next_queue;
+    std::vector<uint32_t> active_rays;
+    
+    std::vector<uint32_t> q_lambert;
+    std::vector<uint32_t> q_metal;
+    std::vector<uint32_t> q_light;
+    
+    std::vector<uint32_t> next_rays;
 };
 
 struct ServiceGDICanvasProvider
@@ -429,7 +440,7 @@ struct SystemGenerateCameraRays
         float    aspect_ratio = static_cast<float>(canvas.width) / static_cast<float>(canvas.height);
 
         size_t count = entities.size();
-        ray_queue.queue.resize(count);
+        ray_queue.active_rays.resize(count);
 
         auto pixels = entities.template get_array<ComponentPixel>();
         auto rays   = entities.template get_array<ComponentRay>();
@@ -438,7 +449,7 @@ struct SystemGenerateCameraRays
         scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
             for(size_t i = start; i < end; ++i)
             {
-                ray_queue.queue[i] = static_cast<uint32_t>(i);
+                ray_queue.active_rays[i] = static_cast<uint32_t>(i);
 
                 auto & pixel = pixels[i];
                 auto & ray   = rays[i];
@@ -478,15 +489,13 @@ struct SystemGenerateCameraRays
 };
 
 /*
- * Shio: The core path tracing logic.
- * Performs one bounce per update call and uses deferred tasks for cyclic
- * execution.
- * Now fully data-parallel across the ray queue and performs PBRT-style filtering
- * on ray termination.
+ * Shio: Intersects active rays with the scene and routes them to material queues.
+ * Decoupled from material evaluation to demonstrate data-oriented processing.
  */
-struct SystemPathBounce
+struct SystemIntersectRays
 {
-    using WriteComponent = Usagi::ComponentList<ComponentRay, ComponentPathState>;
+    using ReadComponent  = Usagi::ComponentList<ComponentRay, ComponentPathState>;
+    using WriteComponent = Usagi::ComponentList<ComponentRayHit>;
     using ReadService    = Usagi::ComponentList<ServiceScene>;
     using WriteService   = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler, ServiceFilm>;
 
@@ -497,107 +506,286 @@ struct SystemPathBounce
         auto & scheduler = services.template get<ServiceScheduler>();
         auto & film      = services.template get<ServiceFilm>();
 
-        ray_queue.next_queue.clear();
-        size_t count = ray_queue.queue.size();
+        ray_queue.next_rays.clear();
+        ray_queue.q_lambert.clear();
+        ray_queue.q_metal.clear();
+        ray_queue.q_light.clear();
+
+        size_t count = ray_queue.active_rays.size();
         if(count == 0) return;
 
         auto rays   = entities.template get_array<ComponentRay>();
+        auto hits   = entities.template get_array<ComponentRayHit>();
         auto states = entities.template get_array<ComponentPathState>();
 
         std::mutex merge_mutex;
 
         scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
-            std::vector<uint32_t> local_next;
-            local_next.reserve(end - start);
+            std::vector<uint32_t> loc_lambert;
+            std::vector<uint32_t> loc_metal;
+            std::vector<uint32_t> loc_light;
 
             for(size_t i = start; i < end; ++i)
             {
-                uint32_t id  = ray_queue.queue[i];
+                uint32_t id  = ray_queue.active_rays[i];
                 auto & ray   = rays[id];
+                auto & hit_c = hits[id];
                 auto & state = states[id];
 
                 if(!state.active) continue;
 
-                auto hit = scene.intersect(ray.origin, ray.direction, ray.t_max);
+                auto opt_hit = scene.intersect(ray.origin, ray.direction, ray.t_max);
 
-                if(hit)
+                if(opt_hit)
                 {
-                    const auto & mat = scene.materials[hit->material_index];
+                    hit_c.did_hit = true;
+                    hit_c.hit = *opt_hit;
 
-                    // Emissive contribution
-                    state.radiance += state.throughput * mat.emission;
-
-                    // Scatter
-                    if(mat.type == MaterialType::Light || state.depth >= 5)
-                    {
+                    const auto & mat = scene.materials[opt_hit->material_index];
+                    
+                    if (state.depth >= 5) {
                         state.active = false;
-                        film.add_sample(state.sample_x, state.sample_y, state.radiance);
-                        continue;
-                    }
-
-                    if(mat.type == MaterialType::Metal)
-                    {
-                        Vector3f reflected = ray.direction - hit->normal * 2.0f * ray.direction.dot(hit->normal);
-                        Vector3f target = reflected;
-                        
-                        if(mat.roughness > 0.0f) {
-                            target = target + random_in_unit_sphere(state.rng) * mat.roughness;
-                        }
-
-                        if(target.dot(hit->normal) > 0.0f) {
-                            ray.origin    = hit->point;
-                            ray.direction = target.normalize();
-                            ray.t_max     = 1000.0f;
-
-                            state.throughput = state.throughput * mat.albedo;
-                            state.depth++;
-
-                            local_next.push_back(id);
-                        } else {
-                            state.active = false;
-                            film.add_sample(state.sample_x, state.sample_y, state.radiance);
-                        }
-                    }
-                    else
-                    {
-                        // Lambertian Scatter via Cosine-Weighted Hemisphere Sampling
-                        ONB onb;
-                        onb.build_from_w(hit->normal);
-                        Vector3f scatter_dir = onb.local(cosine_sample_hemisphere(state.rng.next_float(), state.rng.next_float()));
-
-                        ray.origin    = hit->point;
-                        ray.direction = scatter_dir.normalize();
-                        ray.t_max     = 1000.0f;
-
-                        // Because PDF = cos(theta) / PI and BRDF = albedo / PI, they cancel out exactly.
-                        state.throughput = state.throughput * mat.albedo;
-                        state.depth++;
-
-                        local_next.push_back(id);
+                        loc_light.push_back(id); // Send to light to pick up emission, but it won't bounce
+                    } else if (mat.type == MaterialType::Lambert) {
+                        loc_lambert.push_back(id);
+                    } else if (mat.type == MaterialType::Metal) {
+                        loc_metal.push_back(id);
+                    } else if (mat.type == MaterialType::Light) {
+                        loc_light.push_back(id);
                     }
                 }
                 else
                 {
-                    // Background (Black for Cornell Box)
+                    // Background
+                    hit_c.did_hit = false;
                     state.active = false;
                     film.add_sample(state.sample_x, state.sample_y, state.radiance);
                 }
             }
 
-            if(!local_next.empty())
+            std::lock_guard<std::mutex> lock(merge_mutex);
+            ray_queue.q_lambert.insert(ray_queue.q_lambert.end(), loc_lambert.begin(), loc_lambert.end());
+            ray_queue.q_metal.insert(ray_queue.q_metal.end(), loc_metal.begin(), loc_metal.end());
+            ray_queue.q_light.insert(ray_queue.q_light.end(), loc_light.begin(), loc_light.end());
+        });
+    }
+};
+
+/*
+ * Shio: Evaluates Lambertian materials.
+ */
+struct SystemEvaluateLambert
+{
+    using WriteComponent = Usagi::ComponentList<ComponentRay, ComponentPathState>;
+    using ReadComponent  = Usagi::ComponentList<ComponentRayHit>;
+    using ReadService    = Usagi::ComponentList<ServiceScene>;
+    using WriteService   = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler>;
+
+    void update(auto && entities, auto && services)
+    {
+        auto & scene     = services.template get<ServiceScene>();
+        auto & ray_queue = services.template get<ServiceRayQueue>();
+        auto & scheduler = services.template get<ServiceScheduler>();
+
+        size_t count = ray_queue.q_lambert.size();
+        if(count == 0) return;
+
+        auto rays   = entities.template get_array<ComponentRay>();
+        auto hits   = entities.template get_array<ComponentRayHit>();
+        auto states = entities.template get_array<ComponentPathState>();
+
+        std::mutex merge_mutex;
+
+        scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
+            std::vector<uint32_t> loc_next;
+
+            for(size_t i = start; i < end; ++i)
             {
-                std::lock_guard<std::mutex> lock(merge_mutex);
-                ray_queue.next_queue.insert(ray_queue.next_queue.end(), local_next.begin(), local_next.end());
+                uint32_t id  = ray_queue.q_lambert[i];
+                auto & ray   = rays[id];
+                auto & hit   = hits[id].hit;
+                auto & state = states[id];
+                const auto & mat = scene.materials[hit.material_index];
+
+                state.radiance += state.throughput * mat.emission;
+
+                ONB onb;
+                onb.build_from_w(hit.normal);
+                Vector3f scatter_dir = onb.local(cosine_sample_hemisphere(state.rng.next_float(), state.rng.next_float()));
+
+                ray.origin    = hit.point;
+                ray.direction = scatter_dir.normalize();
+                ray.t_max     = 1000.0f;
+
+                state.throughput = state.throughput * mat.albedo;
+                state.depth++;
+                loc_next.push_back(id);
+            }
+
+            std::lock_guard<std::mutex> lock(merge_mutex);
+            ray_queue.next_rays.insert(ray_queue.next_rays.end(), loc_next.begin(), loc_next.end());
+        });
+    }
+};
+
+/*
+ * Shio: Evaluates Metallic materials.
+ */
+struct SystemEvaluateMetal
+{
+    using WriteComponent = Usagi::ComponentList<ComponentRay, ComponentPathState>;
+    using ReadComponent  = Usagi::ComponentList<ComponentRayHit>;
+    using ReadService    = Usagi::ComponentList<ServiceScene>;
+    using WriteService   = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler, ServiceFilm>;
+
+    void update(auto && entities, auto && services)
+    {
+        auto & scene     = services.template get<ServiceScene>();
+        auto & ray_queue = services.template get<ServiceRayQueue>();
+        auto & scheduler = services.template get<ServiceScheduler>();
+        auto & film      = services.template get<ServiceFilm>();
+
+        size_t count = ray_queue.q_metal.size();
+        if(count == 0) return;
+
+        auto rays   = entities.template get_array<ComponentRay>();
+        auto hits   = entities.template get_array<ComponentRayHit>();
+        auto states = entities.template get_array<ComponentPathState>();
+
+        std::mutex merge_mutex;
+
+        scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
+            std::vector<uint32_t> loc_next;
+
+            for(size_t i = start; i < end; ++i)
+            {
+                uint32_t id  = ray_queue.q_metal[i];
+                auto & ray   = rays[id];
+                auto & hit   = hits[id].hit;
+                auto & state = states[id];
+                const auto & mat = scene.materials[hit.material_index];
+
+                state.radiance += state.throughput * mat.emission;
+
+                Vector3f reflected = ray.direction - hit.normal * 2.0f * ray.direction.dot(hit.normal);
+                Vector3f target = reflected;
+                
+                if(mat.roughness > 0.0f) {
+                    target = target + random_in_unit_sphere(state.rng) * mat.roughness;
+                }
+
+                if(target.dot(hit.normal) > 0.0f) {
+                    ray.origin    = hit.point;
+                    ray.direction = target.normalize();
+                    ray.t_max     = 1000.0f;
+
+                    state.throughput = state.throughput * mat.albedo;
+                    state.depth++;
+                    loc_next.push_back(id);
+                } else {
+                    state.active = false;
+                    film.add_sample(state.sample_x, state.sample_y, state.radiance);
+                }
+            }
+
+            std::lock_guard<std::mutex> lock(merge_mutex);
+            ray_queue.next_rays.insert(ray_queue.next_rays.end(), loc_next.begin(), loc_next.end());
+        });
+    }
+};
+
+/*
+ * Shio: Evaluates Emissive/Light materials.
+ */
+struct SystemEvaluateLight
+{
+    using WriteComponent = Usagi::ComponentList<ComponentPathState>;
+    using ReadComponent  = Usagi::ComponentList<ComponentRayHit>;
+    using ReadService    = Usagi::ComponentList<ServiceScene>;
+    using WriteService   = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler, ServiceFilm>;
+
+    void update(auto && entities, auto && services)
+    {
+        auto & scene     = services.template get<ServiceScene>();
+        auto & ray_queue = services.template get<ServiceRayQueue>();
+        auto & scheduler = services.template get<ServiceScheduler>();
+        auto & film      = services.template get<ServiceFilm>();
+
+        size_t count = ray_queue.q_light.size();
+        if(count == 0) return;
+
+        auto hits   = entities.template get_array<ComponentRayHit>();
+        auto states = entities.template get_array<ComponentPathState>();
+
+        scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
+            for(size_t i = start; i < end; ++i)
+            {
+                uint32_t id  = ray_queue.q_light[i];
+                auto & hit   = hits[id].hit;
+                auto & state = states[id];
+                const auto & mat = scene.materials[hit.material_index];
+
+                state.radiance += state.throughput * mat.emission;
+                state.active = false;
+                film.add_sample(state.sample_x, state.sample_y, state.radiance);
             }
         });
+    }
+};
 
-        if(!ray_queue.next_queue.empty())
+/*
+ * Shio: Cyclic Coordinator for Path Tracing Loop
+ * Enqueues the next iteration if any rays remain active.
+ */
+struct SystemPathTracingCoordinator
+{
+    using ReadService  = Usagi::ComponentList<>;
+    using WriteService = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler>;
+
+    void update(auto && entities, auto && services)
+    {
+        auto & ray_queue = services.template get<ServiceRayQueue>();
+        [[maybe_unused]]
+        auto & scheduler = services.template get<ServiceScheduler>();
+
+        // If this is the initial pass (e.g. from GenerateCameraRays), active_rays will be populated.
+        // We only process if there is something in active_rays.
+        if(!ray_queue.active_rays.empty())
         {
-            std::swap(ray_queue.queue, ray_queue.next_queue);
-            scheduler.host->submit_deferred_task(
-                [this, &entities, &services]() {
-                    this->update(entities, services);
-                });
+            this->update_bounce_graph(entities, services);
+        }
+    }
+
+    void update_bounce_graph(auto && entities, auto && services)
+    {
+        SystemIntersectRays sys_intersect;
+        sys_intersect.update(entities, services);
+
+        SystemEvaluateLambert sys_lambert;
+        sys_lambert.update(entities, services);
+
+        SystemEvaluateMetal sys_metal;
+        sys_metal.update(entities, services);
+
+        SystemEvaluateLight sys_light;
+        sys_light.update(entities, services);
+
+        auto & ray_queue = services.template get<ServiceRayQueue>();
+        auto & scheduler = services.template get<ServiceScheduler>();
+
+        if(!ray_queue.next_rays.empty())
+        {
+            std::swap(ray_queue.active_rays, ray_queue.next_rays);
+            ray_queue.next_rays.clear();
+
+            scheduler.host->submit_deferred_task([this, &entities, &services]() {
+                // Re-evaluate the entire bounce graph with the new active_rays
+                this->update_bounce_graph(entities, services);
+            });
+        }
+        else
+        {
+            ray_queue.active_rays.clear();
         }
     }
 };
