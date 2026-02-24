@@ -479,7 +479,51 @@ struct ServiceScene
         }
         return false;
     }
+
+    float get_light_area() const {
+        float area = 0.0f;
+        for (const auto& b : boxes) {
+            if (materials[b.material_index].type == MaterialType::Light) {
+                Vector3f d = b.max - b.min;
+                area += 2.0f * (d.x*d.y + d.x*d.z + d.y*d.z);
+            }
+        }
+        return area;
+    }
 };
+
+inline float compute_mis_weight(const PathVertex* path, int k, int s, float light_area) {
+    float sum_W2 = 0.0f;
+    float W2_s = 0.0f;
+
+    for (int i = 0; i < k; ++i) {
+        float W_i = 0.0f;
+        if (i == 0) {
+            W_i = light_area; // PDF of sampling the area light directly
+        } else {
+            if (path[i-1].is_delta || path[i].is_delta) {
+                W_i = 0.0f; // Cannot connect to a delta/specular surface
+            } else {
+                Vector3f diff = path[i].p - path[i-1].p;
+                float dist2 = diff.length_squared();
+                if (dist2 > 0.00001f) {
+                    float dist = std::sqrt(dist2);
+                    Vector3f L = diff * (1.0f / dist);
+                    float ndotl_a = std::abs(path[i-1].n.dot(L));
+                    float ndotl_b = std::abs(path[i].n.dot(-L));
+                    if (ndotl_a > 0.0f && ndotl_b > 0.0f) {
+                        float G = (ndotl_a * ndotl_b) / dist2;
+                        W_i = PI / G; // 1 / Area PDF
+                    }
+                }
+            }
+        }
+        float w2 = W_i * W_i;
+        sum_W2 += w2;
+        if (i == s) W2_s = w2;
+    }
+    return sum_W2 > 0.0f ? W2_s / sum_W2 : 0.0f;
+}
 
 // -----------------------------------------------------------------------------
 // Systems
@@ -573,8 +617,9 @@ struct SystemGenerateRays
                         ONB onb; onb.build_from_w(n);
                         Vector3f dir = onb.local(cosine_sample_hemisphere(state.rng.next_float(), state.rng.next_float()));
                         
-                        // First light vertex is the point on the light source
-                        lpaths[i].vertices[0] = {p, n, state.throughput, {1,1,1}, false};
+                        // First light vertex is the point on the light source.
+                        // Setting albedo to PI ensures the 1/PI lambertian factor correctly cancels when connecting directly.
+                        lpaths[i].vertices[0] = {p, n, state.throughput, {PI,PI,PI}, false};
                         lpaths[i].count = 1;
                         
                         ray.origin = p + n * 0.001f;
@@ -855,10 +900,19 @@ struct SystemEvaluateLight
                 auto & state = states[id];
                 const auto & mat = scene.materials[hit.material_index];
 
-                if (state_svc.pass == 1 && state.last_bounce_specular) {
+                if (state_svc.pass == 1) { // Removed last_bounce_specular check to cover diffuse direct hits
                     auto & cpath = cpaths[id];
-                    cpath.direct_emission = state.throughput * mat.emission;
-                    cpath.direct_depth = state.depth;
+                    
+                    PathVertex path[MAX_PATH_DEPTH + 1];
+                    path[0] = {hit.point, hit.normal, {1,1,1}, {PI,PI,PI}, false};
+                    for (int j = 0; j < cpath.count; ++j) {
+                        path[1 + j] = cpath.vertices[cpath.count - 1 - j];
+                    }
+                    
+                    float light_area = scene.get_light_area();
+                    float mis_weight = compute_mis_weight(path, cpath.count + 1, 0, light_area);
+                    
+                    cpath.direct_emission = state.throughput * mat.emission * mis_weight;
                 }
                 state.active = false;
             }
@@ -896,7 +950,13 @@ struct SystemConnectPaths
                 auto & lpath = lpaths[i];
                 auto & state = states[i];
 
-                Color3f total_L = state.radiance; // Includes NEE
+                float light_area = scene.get_light_area();
+                Color3f total_L = {0,0,0};
+
+                // Add explicit camera direct hit emission
+                if (cpath.direct_emission.x > 0.0f || cpath.direct_emission.y > 0.0f || cpath.direct_emission.z > 0.0f) {
+                     total_L += cpath.direct_emission;
+                }
 
                 for (int t = 1; t <= cpath.count; ++t) {
                     auto & cv = cpath.vertices[t - 1];
@@ -908,6 +968,7 @@ struct SystemConnectPaths
 
                         Vector3f diff = lv.p - cv.p;
                         float dist2 = diff.length_squared();
+                        if (dist2 < 0.00001f) continue;
                         float dist = std::sqrt(dist2);
                         Vector3f L = diff * (1.0f / dist);
 
@@ -921,16 +982,15 @@ struct SystemConnectPaths
                                 Color3f brdf_l = lv.albedo * (1.0f / PI);
                                 Color3f contrib = cv.beta * brdf_c * G * brdf_l * lv.beta;
                                 
-                                float mis_weight = 1.0f; // Simplified weighting for un-optimized heuristic
+                                PathVertex path[MAX_PATH_DEPTH * 2];
+                                for (int j = 0; j < s; ++j) path[j] = lpath.vertices[j];
+                                for (int j = 0; j < t; ++j) path[s + j] = cpath.vertices[t - 1 - j];
+                                
+                                float mis_weight = compute_mis_weight(path, s + t, s, light_area);
                                 total_L += contrib * mis_weight;
                             }
                         }
                     }
-                }
-
-                // Add explicit camera direct hit emission (for non-BDPT pure hit paths)
-                if (cpath.direct_emission.x > 0.0f || cpath.direct_emission.y > 0.0f || cpath.direct_emission.z > 0.0f) {
-                     total_L += cpath.direct_emission;
                 }
 
                 film.add_sample(state.sample_x, state.sample_y, total_L);
