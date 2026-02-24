@@ -1,6 +1,8 @@
 <Project>
-  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)..\'))" />
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))"
+          Condition="'' != $([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))"/>
   <PropertyGroup>
-    <Dir_IncludePath>$(SolutionDir)Library;$(SolutionDir)Modules;$(Dir_IncludePath)</Dir_IncludePath>
+    <Usagi_IncludePaths>$(SolutionDir)Modules;$(Usagi_IncludePaths)</Usagi_IncludePaths>
+    <Usagi_LibraryPaths>$(Usagi_LibraryPaths)</Usagi_LibraryPaths>
   </PropertyGroup>
 </Project>
