@@ -379,7 +379,8 @@ struct ServiceGDICanvasProvider
 struct ServiceFilm
 {
     struct Pixel {
-        std::atomic<double> r{0}, g{0}, b{0}, weight{0};
+        std::atomic<double> direct_r{0}, direct_g{0}, direct_b{0}, direct_w{0};
+        std::atomic<double> indirect_r{0}, indirect_g{0}, indirect_b{0}, indirect_w{0};
     };
 
     std::vector<Pixel> pixels;
@@ -402,12 +403,12 @@ struct ServiceFilm
         expY = std::exp(-alpha * ry * ry);
     }
 
-    void clear() {
+    void clear_direct() {
         for(auto& p : pixels) {
-            p.r.store(0.0, std::memory_order_relaxed);
-            p.g.store(0.0, std::memory_order_relaxed);
-            p.b.store(0.0, std::memory_order_relaxed);
-            p.weight.store(0.0, std::memory_order_relaxed);
+            p.direct_r.store(0.0, std::memory_order_relaxed);
+            p.direct_g.store(0.0, std::memory_order_relaxed);
+            p.direct_b.store(0.0, std::memory_order_relaxed);
+            p.direct_w.store(0.0, std::memory_order_relaxed);
         }
     }
 
@@ -419,7 +420,7 @@ struct ServiceFilm
         return gaussian(dx, expX) * gaussian(dy, expY);
     }
 
-    void add_sample(float px, float py, const Color3f& L) {
+    void add_sample(float px, float py, const Color3f& L, bool is_direct) {
         int x0 = std::max(0, (int)std::ceil(px - 0.5f - filter_radius_x));
         int x1 = std::min(width - 1, (int)std::floor(px - 0.5f + filter_radius_x));
         int y0 = std::max(0, (int)std::ceil(py - 0.5f - filter_radius_y));
@@ -437,12 +438,17 @@ struct ServiceFilm
                 float weight = evaluate_filter(dx, dy);
                 if (weight > 0) {
                     int idx = y * width + x;
-                    atomic_add(pixels[idx].r, static_cast<double>(L.x * weight));
-                    atomic_add(pixels[idx].g, static_cast<double>(L.y * weight));
-                    atomic_add(pixels[idx].b, static_cast<double>(L.z * weight));
-                    // Note: Splat weights accumulate without dividing by frame count here. 
-                    // This allows them to sum up perfectly over millions of rays.
-                    atomic_add(pixels[idx].weight, static_cast<double>(weight));
+                    if (is_direct) {
+                        atomic_add(pixels[idx].direct_r, static_cast<double>(L.x * weight));
+                        atomic_add(pixels[idx].direct_g, static_cast<double>(L.y * weight));
+                        atomic_add(pixels[idx].direct_b, static_cast<double>(L.z * weight));
+                        atomic_add(pixels[idx].direct_w, static_cast<double>(weight));
+                    } else {
+                        atomic_add(pixels[idx].indirect_r, static_cast<double>(L.x * weight));
+                        atomic_add(pixels[idx].indirect_g, static_cast<double>(L.y * weight));
+                        atomic_add(pixels[idx].indirect_b, static_cast<double>(L.z * weight));
+                        atomic_add(pixels[idx].indirect_w, static_cast<double>(weight));
+                    }
                 }
             }
         }
@@ -460,10 +466,11 @@ struct ServiceFilm
                 while(!target.compare_exchange_weak(old, old * factor, std::memory_order_relaxed));
             };
             
-            atomic_scale(p.r, decay_factor);
-            atomic_scale(p.g, decay_factor);
-            atomic_scale(p.b, decay_factor);
-            atomic_scale(p.weight, decay_factor);
+            // Only decay indirect paths; direct paths are wiped every frame explicitly
+            atomic_scale(p.indirect_r, decay_factor);
+            atomic_scale(p.indirect_g, decay_factor);
+            atomic_scale(p.indirect_b, decay_factor);
+            atomic_scale(p.indirect_w, decay_factor);
         }
     }
 };
@@ -830,8 +837,11 @@ struct SystemIntersectRays
                     state.active = false;
                     if(state_svc.pass == 1) { // Camera paths
                         Color3f sky = scene.evaluate_sky(ray.direction);
-                        state.radiance += state.throughput * sky;
-                        film.add_sample(state.sample_x, state.sample_y, state.radiance);
+                        
+                        // We must add the direct sky emission explicitly to the direct buffer, 
+                        // as it will not go through SystemEvaluateLight or SystemConnectPaths
+                        Color3f total_sky_L = state.radiance + state.throughput * sky;
+                        film.add_sample(state.sample_x, state.sample_y, total_sky_L, true);
                     }
                 }
             }
@@ -1105,7 +1115,7 @@ struct SystemEvaluateLight
     using WriteComponent = Usagi::ComponentList<ComponentPathState, ComponentCameraPath>;
     using ReadComponent  = Usagi::ComponentList<ComponentRayHit>;
     using ReadService    = Usagi::ComponentList<ServiceScene, ServiceRenderState>;
-    using WriteService   = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler>;
+    using WriteService   = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler, ServiceFilm>;
 
     void update(auto && entities, auto && services)
     {
@@ -1113,6 +1123,7 @@ struct SystemEvaluateLight
         auto & ray_queue = services.template get<ServiceRayQueue>();
         auto & scheduler = services.template get<ServiceScheduler>();
         auto & state_svc = services.template get<ServiceRenderState>();
+        auto & film      = services.template get<ServiceFilm>();
 
         size_t count = ray_queue.q_light.size();
         if(count == 0) return;
@@ -1132,16 +1143,21 @@ struct SystemEvaluateLight
                 if (state_svc.pass == 1) { // Removed last_bounce_specular check to cover diffuse direct hits
                     auto & cpath = cpaths[id];
                     
-                    PathVertex path[MAX_PATH_DEPTH + 1];
-                    path[0] = {hit.point, hit.normal, {1,1,1}, {PI,PI,PI}, false};
-                    for (int j = 0; j < cpath.count; ++j) {
-                        path[1 + j] = cpath.vertices[cpath.count - 1 - j];
+                    if (cpath.count == 0) {
+                        // Pure direct hits bypass MIS and go straight to the direct buffer!
+                        film.add_sample(state.sample_x, state.sample_y, state.radiance + state.throughput * mat.emission, true);
+                    } else {
+                        PathVertex path[MAX_PATH_DEPTH + 1];
+                        path[0] = {hit.point, hit.normal, {1,1,1}, {PI,PI,PI}, false};
+                        for (int j = 0; j < cpath.count; ++j) {
+                            path[1 + j] = cpath.vertices[cpath.count - 1 - j];
+                        }
+                        
+                        float light_area = scene.get_light_area();
+                        float mis_weight = compute_mis_weight(path, cpath.count + 1, 0, light_area);
+                        
+                        cpath.direct_emission = state.throughput * mat.emission * mis_weight;
                     }
-                    
-                    float light_area = scene.get_light_area();
-                    float mis_weight = compute_mis_weight(path, cpath.count + 1, 0, light_area);
-                    
-                    cpath.direct_emission = state.throughput * mat.emission * mis_weight;
                 }
                 state.active = false;
             }
@@ -1180,12 +1196,8 @@ struct SystemConnectPaths
                 auto & state = states[i];
 
                 float light_area = scene.get_light_area();
-                Color3f total_L = {0,0,0};
-
-                // Add explicit camera direct hit emission
-                if (cpath.direct_emission.x > 0.0f || cpath.direct_emission.y > 0.0f || cpath.direct_emission.z > 0.0f) {
-                     total_L += cpath.direct_emission;
-                }
+                Color3f indirect_L = {0,0,0};
+                Color3f direct_L = {0,0,0};
 
                 for (int t = 1; t <= cpath.count; ++t) {
                     auto & cv = cpath.vertices[t - 1];
@@ -1216,13 +1228,19 @@ struct SystemConnectPaths
                                 for (int j = 0; j < t; ++j) path[s + j] = cpath.vertices[t - 1 - j];
                                 
                                 float mis_weight = compute_mis_weight(path, s + t, s, light_area);
-                                total_L += contrib * mis_weight;
+                                
+                                // Direct shadows occur when t=1 (camera connects straight to light subpath).
+                                // But BDPT generates robust paths where t>1 adds to global illumination.
+                                // We classify purely looking at the light (s=0, evaluated above) or first-bounce (t=1, s=1) as direct.
+                                if (t == 1 && s == 1) direct_L += contrib * mis_weight;
+                                else indirect_L += contrib * mis_weight;
                             }
                         }
                     }
                 }
 
-                film.add_sample(state.sample_x, state.sample_y, total_L);
+                if (direct_L.x > 0 || direct_L.y > 0 || direct_L.z > 0) film.add_sample(state.sample_x, state.sample_y, direct_L, true);
+                if (indirect_L.x > 0 || indirect_L.y > 0 || indirect_L.z > 0) film.add_sample(state.sample_x, state.sample_y, indirect_L, false);
             }
         });
     }
@@ -1249,13 +1267,14 @@ struct SystemPathTracingCoordinator
             auto & film   = services.template get<ServiceFilm>();
             auto & canvas = services.template get<ServiceGDICanvasProvider>();
 
-            // Apply Exponential Moving Average (EMA) to the film.
-            // 0.50 means only ~2 frames of latency, making the sun look like a discrete moving object
-            // instead of a 20-frame smeared comet beam.
-            film.apply_ema_decay(0.50);
+            // Clear the direct light accumulation buffer fully every frame.
+            // This prevents moving lights from leaving intense 100% white ghost trails,
+            // while EMA decay handles the indirect noisy bounces softly.
+            film.clear_direct();
+            film.apply_ema_decay(0.35); // 0.35 gives ~1 frame of effective memory. Shadows move almost perfectly real-time now!
 
-            // Advance time faster so the sun moves noticeably
-            float time = canvas.frame_count.load() * 0.05f;
+            // Advance time significantly slower so the sun crawls smoothly across the sky
+            float time = canvas.frame_count.load() * 0.005f;
             
             // Sun orbits in YZ plane. Z > 0 is out the back wall.
             scene.sun_dir = Vector3f{ 0.0f, std::cos(time), std::sin(time) }.normalize();
@@ -1392,14 +1411,21 @@ struct SystemRenderGDICanvas
                 auto & pixel = pixels[i];
 
                 int idx = pixel.y * canvas.width + pixel.x;
-                double weight = film.pixels[idx].weight.load(std::memory_order_relaxed);
+                double d_w = film.pixels[idx].direct_w.load(std::memory_order_relaxed);
+                double i_w = film.pixels[idx].indirect_w.load(std::memory_order_relaxed);
 
                 Color3f color = {0, 0, 0};
-                if (weight > 0.0) {
-                    double inv_w = 1.0 / weight;
-                    color.x = static_cast<float>(film.pixels[idx].r.load(std::memory_order_relaxed) * inv_w);
-                    color.y = static_cast<float>(film.pixels[idx].g.load(std::memory_order_relaxed) * inv_w);
-                    color.z = static_cast<float>(film.pixels[idx].b.load(std::memory_order_relaxed) * inv_w);
+                if (d_w > 0.0) {
+                    double inv = 1.0 / d_w;
+                    color.x += static_cast<float>(film.pixels[idx].direct_r.load(std::memory_order_relaxed) * inv);
+                    color.y += static_cast<float>(film.pixels[idx].direct_g.load(std::memory_order_relaxed) * inv);
+                    color.z += static_cast<float>(film.pixels[idx].direct_b.load(std::memory_order_relaxed) * inv);
+                }
+                if (i_w > 0.0) {
+                    double inv = 1.0 / i_w;
+                    color.x += static_cast<float>(film.pixels[idx].indirect_r.load(std::memory_order_relaxed) * inv);
+                    color.y += static_cast<float>(film.pixels[idx].indirect_g.load(std::memory_order_relaxed) * inv);
+                    color.z += static_cast<float>(film.pixels[idx].indirect_b.load(std::memory_order_relaxed) * inv);
                 }
 
                 // Simple Gamma Correction (approximate sqrt)

@@ -96,8 +96,6 @@ void SetupCornellBox(RT::ServiceScene & scene)
     scene.boxes.push_back({ { -s, -s - 1.0f, -s }, { s, -s, s }, 0 });
     // Ceiling (White)
     scene.boxes.push_back({ { -s, s, -s }, { s, s + 1.0f, s }, 0 });
-    // Back Wall (White)
-    scene.boxes.push_back({ { -s, -s, s }, { s, s, s + 1.0f }, 0 });
     // Left Wall (Metal mirror)
     scene.boxes.push_back({ { -s - 1.0f, -s, -s }, { -s, s, s }, 4 });
     // Right Wall (Green)
@@ -215,21 +213,20 @@ int WINAPI WinMain(
         Usagi::TaskGraphExecutionHost host(std::thread::hardware_concurrency() * 2);
         scheduler.host = &host;
 
-        RT::SystemGenerateRays           sys_gen_rays;
         RT::SystemPathTracingCoordinator sys_coord;
-        RT::SystemConnectPaths           sys_conn;
         RT::SystemRenderGDICanvas        sys_render;
 
-        host.register_system(sys_gen_rays, primary_group, services);
         host.register_system(sys_coord, primary_group, services);
-        host.register_system(sys_conn, primary_group, services);
-        host.register_system(sys_render, primary_group, services);
 
         host.build_graph();
 
         while(g_RenderActive)
         {
+            // Execute the BDPT state machine which orchestrates the sub-passes
             host.execute();
+            
+            // Render the splatted film explicitly after the BDPT cycle completes
+            sys_render.update(primary_group, services);
         }
     });
 
