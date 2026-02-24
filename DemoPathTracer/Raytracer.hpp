@@ -2,23 +2,37 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
+#include <optional>
+#include <numbers>
 
 #include "UsagiCore.hpp"
 
 namespace RT
 {
 
-/*
- * Shio: Standard 3D vector structure used for positions, directions, and colors.
- * Includes basic arithmetic operator overloading.
- */
+// -----------------------------------------------------------------------------
+// Math & Utilities
+// -----------------------------------------------------------------------------
+constexpr float PI = 3.14159265359f;
+
 struct Vector3f
 {
     float x, y, z;
 
+    float & operator[](int i) { return (&x)[i]; }
+    const float & operator[](int i) const { return (&x)[i]; }
+
+    Vector3f operator-() const { return { -x, -y, -z }; }
+
     Vector3f operator+(const Vector3f & o) const
     {
         return { x + o.x, y + o.y, z + o.z };
+    }
+
+    Vector3f & operator+=(const Vector3f & o)
+    {
+        x += o.x; y += o.y; z += o.z; return *this;
     }
 
     Vector3f operator-(const Vector3f & o) const
@@ -26,13 +40,26 @@ struct Vector3f
         return { x - o.x, y - o.y, z - o.z };
     }
 
+    Vector3f operator*(const Vector3f & o) const
+    {
+        return { x * o.x, y * o.y, z * o.z };
+    }
+
     Vector3f operator*(float s) const { return { x * s, y * s, z * s }; }
 
     float dot(const Vector3f & o) const { return x * o.x + y * o.y + z * o.z; }
 
+    Vector3f cross(const Vector3f & o) const
+    {
+        return { y * o.z - z * o.y, z * o.x - x * o.z, x * o.y - y * o.x };
+    }
+
+    float length_squared() const { return x * x + y * y + z * z; }
+    float length() const { return std::sqrt(length_squared()); }
+
     Vector3f normalize() const
     {
-        float len = std::sqrt(dot(*this));
+        float len = length();
         if(len > 0.000001f) return { x / len, y / len, z / len };
         return { 0.0f, 0.0f, 0.0f };
     }
@@ -41,44 +68,226 @@ struct Vector3f
 typedef Vector3f Normal3f;
 typedef Vector3f Color3f;
 
+/*
+ * Shio: Xorshift32 for fast per-pixel random number generation.
+ */
+struct XorShift32
+{
+    uint32_t state;
+
+    void seed(uint32_t s) { state = s ? s : 1337; }
+
+    uint32_t next_u32()
+    {
+        uint32_t x = state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        state = x;
+        return x;
+    }
+
+    // Returns float in [0, 1)
+    float next_float()
+    {
+        return (next_u32() & 0xFFFFFF) / 16777216.0f;
+    }
+};
+
+/*
+ * Shio: Generates a random point inside the unit sphere.
+ * Used for diffuse scattering.
+ */
+inline Vector3f random_in_unit_sphere(XorShift32 & rng)
+{
+    while(true)
+    {
+        Vector3f p = {
+            rng.next_float() * 2.0f - 1.0f,
+            rng.next_float() * 2.0f - 1.0f,
+            rng.next_float() * 2.0f - 1.0f
+        };
+        if(p.length_squared() < 1.0f) return p;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Scene Definitions
+// -----------------------------------------------------------------------------
+
+enum class MaterialType
+{
+    Lambert,
+    Metal,
+    Light
+};
+
+struct Material
+{
+    MaterialType type;
+    Color3f      albedo;
+    Color3f      emission;
+    float        roughness; // For Metal
+};
+
+struct HitRecord
+{
+    float    t;
+    Vector3f point;
+    Normal3f normal;
+    int      material_index;
+};
+
+struct Sphere
+{
+    Vector3f center;
+    float    radius;
+    int      material_index;
+
+    std::optional<float> intersect(const Vector3f & o, const Vector3f & d, float t_min, float t_max) const
+    {
+        Vector3f oc = o - center;
+        float a = d.length_squared();
+        float half_b = oc.dot(d);
+        float c = oc.length_squared() - radius * radius;
+        float discriminant = half_b * half_b - a * c;
+
+        if(discriminant < 0) return std::nullopt;
+        float sqrtd = std::sqrt(discriminant);
+
+        float root = (-half_b - sqrtd) / a;
+        if(root < t_min || root > t_max)
+        {
+            root = (-half_b + sqrtd) / a;
+            if(root < t_min || root > t_max) return std::nullopt;
+        }
+        return root;
+    }
+};
+
+/*
+ * Shio: Axis-Aligned Box defined by min/max points.
+ */
+struct Box
+{
+    Vector3f min;
+    Vector3f max;
+    int      material_index;
+
+    std::optional<float> intersect(const Vector3f & o, const Vector3f & d, float t_min, float t_max) const
+    {
+        float t0 = t_min, t1 = t_max;
+        
+        for (int i = 0; i < 3; ++i) {
+            float invD = 1.0f / d[i];
+            float tNear = (min[i] - o[i]) * invD;
+            float tFar  = (max[i] - o[i]) * invD;
+            if (invD < 0.0f) std::swap(tNear, tFar);
+            t0 = tNear > t0 ? tNear : t0;
+            t1 = tFar  < t1 ? tFar  : t1;
+            if (t1 <= t0) return std::nullopt;
+        }
+        return t0;
+    }
+
+    Normal3f get_normal(const Vector3f & p) const
+    {
+        // Determine which face we hit
+        const float epsilon = 0.0001f;
+        if (std::abs(p.x - min.x) < epsilon) return {-1, 0, 0};
+        if (std::abs(p.x - max.x) < epsilon) return { 1, 0, 0};
+        if (std::abs(p.y - min.y) < epsilon) return { 0,-1, 0};
+        if (std::abs(p.y - max.y) < epsilon) return { 0, 1, 0};
+        if (std::abs(p.z - min.z) < epsilon) return { 0, 0,-1};
+        if (std::abs(p.z - max.z) < epsilon) return { 0, 0, 1};
+        return {0, 1, 0};
+    }
+};
+
 // -----------------------------------------------------------------------------
 // Components
 // -----------------------------------------------------------------------------
 
-/*
- * Shio: Represents a ray in 3D space.
- * Stored in a structure-of-arrays format by ComponentGroup.
- */
 struct ComponentRay
 {
     Vector3f origin;
     Normal3f direction;
-    Color3f  color;   // Accumulates color during traversal
-    float    t_max;   // Max distance for intersection
+    float    t_max;
 };
 
-/*
- * Shio: Screen-space coordinates for a ray.
- * Used to map the ray back to the display buffer.
- */
 struct ComponentPixel
 {
     int x, y;
+};
+
+/*
+ * Shio: Holds the path tracing state for a single sample.
+ * Allows the ray to 'pause' and 'resume' between system updates (bounces).
+ */
+struct ComponentPathState
+{
+    Color3f    throughput;
+    Color3f    accumulated_radiance;
+    XorShift32 rng;
+    int        depth;
+    bool       active;
+    int        sample_count; // For progressive accumulation
 };
 
 // -----------------------------------------------------------------------------
 // Services
 // -----------------------------------------------------------------------------
 
-/*
- * Shio: Service to provide access to the raw GDI pixel buffer.
- * Systems use this to write the final rendered frame.
- */
 struct ServiceGDICanvasProvider
 {
     uint32_t * pixel_buffer;
     int        width;
     int        height;
+    int        frame_count = 0;
+};
+
+/*
+ * Shio: Stores the scene geometry and materials.
+ */
+struct ServiceScene
+{
+    std::vector<Sphere>   spheres;
+    std::vector<Box>      boxes;
+    std::vector<Material> materials;
+
+    std::optional<HitRecord> intersect(const Vector3f & o, const Vector3f & d, float t_max)
+    {
+        HitRecord rec;
+        rec.t = t_max;
+        bool hit_anything = false;
+
+        for(const auto & s : spheres)
+        {
+            if(auto t = s.intersect(o, d, 0.001f, rec.t))
+            {
+                rec.t = *t;
+                rec.point = o + d * rec.t;
+                rec.normal = (rec.point - s.center).normalize();
+                rec.material_index = s.material_index;
+                hit_anything = true;
+            }
+        }
+
+        for(const auto & b : boxes)
+        {
+            if(auto t = b.intersect(o, d, 0.001f, rec.t))
+            {
+                rec.t = *t;
+                rec.point = o + d * rec.t;
+                rec.normal = b.get_normal(rec.point);
+                rec.material_index = b.material_index;
+                hit_anything = true;
+            }
+        }
+
+        if(hit_anything) return rec;
+        return std::nullopt;
+    }
 };
 
 // -----------------------------------------------------------------------------
@@ -86,142 +295,127 @@ struct ServiceGDICanvasProvider
 // -----------------------------------------------------------------------------
 
 /*
- * Shio: Initializes rays for each pixel based on a simple pinhole camera model.
+ * Shio: Initializes rays for the start of a frame (or a new sample).
  */
 struct SystemGenerateCameraRays
 {
     void update(auto && entities, auto && services)
     {
         auto & canvas = services.template get<ServiceGDICanvasProvider>();
+        canvas.frame_count++;
 
-        // Hardcoded camera position
-        Vector3f cam_pos      = { 0.0f, 5.0f, -8.0f };
-        float    aspect_ratio = static_cast<float>(canvas.width) /
-            static_cast<float>(canvas.height);
+        Vector3f cam_pos = { 0.0f, 5.0f, -18.0f }; // Moved back to see full box
+        float aspect_ratio = static_cast<float>(canvas.width) / static_cast<float>(canvas.height);
 
-        // Iterate over all entities with Pixel and Ray components
-        entities.template query<ComponentPixel, ComponentRay>()(
-            [&](ComponentPixel & pixel, ComponentRay & ray) {
-                // Map pixel coordinates to Normalized Device Coordinates (NDC) [-1, 1]
-                float px = (2.0f * ((pixel.x + 0.5f) / canvas.width) - 1.0f) *
-                    aspect_ratio;
-                float py = 1.0f - 2.0f * ((pixel.y + 0.5f) / canvas.height);
+        entities.template query<ComponentPixel, ComponentRay, ComponentPathState>()(
+            [&](ComponentPixel & pixel, ComponentRay & ray, ComponentPathState & state) {
+                
+                // Initialize RNG once per pixel
+                if(state.rng.state == 0) {
+                    state.rng.seed(pixel.y * canvas.width + pixel.x + 1);
+                }
 
-                ray.origin    = cam_pos;
-                // Simple perspective projection (z = 1.0f is the image plane)
-                ray.direction = Vector3f { px, py, 1.0f }.normalize();
-                ray.color     = { 0.0f, 0.0f, 0.0f };
-                ray.t_max     = 1000.0f; // Far clip plane
+                // Jitter for anti-aliasing
+                float u = (pixel.x + state.rng.next_float()) / (float)canvas.width;
+                float v = (pixel.y + state.rng.next_float()) / (float)canvas.height;
+                
+                // NDC to Camera Space
+                float px = (2.0f * u - 1.0f) * aspect_ratio;
+                float py = 1.0f - 2.0f * v;
+
+                ray.origin = cam_pos;
+                ray.direction = Vector3f { px, py, 1.0f }.normalize(); // looking down +Z
+                ray.t_max = 1000.0f;
+
+                // Reset path state for new sample
+                state.throughput = { 1.0f, 1.0f, 1.0f };
+                
+                // For progressive rendering: only clear accumulation on the first frame.
+                // If the user wants to restart, they would reset frame_count.
+                if (canvas.frame_count == 1) state.accumulated_radiance = {0,0,0};
+                
+                state.depth = 0;
+                state.active = true;
             });
     }
 };
 
 /*
- * Shio: Performs intersection tests against the scene geometry.
- * The scene is currently hardcoded within the system for simplicity.
- * Calculates simple diffuse shading based on a fixed light direction.
+ * Shio: The core path tracing logic.
+ * Performs one bounce per update call.
  */
-struct SystemEvaluatePhysicalMaterial
+struct SystemPathBounce
 {
     void update(auto && entities, auto && services)
     {
-        entities.template query<ComponentRay>()([](ComponentRay & ray) {
-            [[maybe_unused]]
-            float    t_min     = 0.0f;
-            float    t_max     = ray.t_max;
-            Vector3f normal    = { 0, 0, 0 };
-            Color3f  hit_color = { 0, 0, 0 };
+        auto & scene = services.template get<ServiceScene>();
 
-            // Floor (y = 0)
-            if(ray.direction.y < 0.0f)
-            {
-                float t = (0.0f - ray.origin.y) / ray.direction.y;
-                if(t > 0 && t < t_max)
+        entities.template query<ComponentRay, ComponentPathState>()(
+            [&](ComponentRay & ray, ComponentPathState & state) {
+                if(!state.active) return;
+
+                auto hit = scene.intersect(ray.origin, ray.direction, ray.t_max);
+
+                if(hit)
                 {
-                    t_max     = t;
-                    normal    = { 0, 1, 0 };
-                    hit_color = { 0.8f, 0.8f, 0.8f };
-                }
-            }
+                    const auto & mat = scene.materials[hit->material_index];
 
-            // Left Wall (x = -5)
-            if(ray.direction.x < 0.0f)
-            {
-                float t = (-5.0f - ray.origin.x) / ray.direction.x;
-                if(t > 0 && t < t_max)
+                    // Emissive contribution
+                    state.accumulated_radiance += state.throughput * mat.emission;
+
+                    // Scatter
+                    if(mat.type == MaterialType::Light || state.depth >= 5)
+                    {
+                        state.active = false;
+                        return;
+                    }
+
+                    // Lambertian Scatter
+                    // Target = point + normal + random_unit_vector
+                    Vector3f target = hit->point + hit->normal + random_in_unit_sphere(state.rng).normalize();
+                    
+                    ray.origin = hit->point;
+                    ray.direction = (target - hit->point).normalize();
+                    ray.t_max = 1000.0f;
+                    
+                    state.throughput = state.throughput * mat.albedo;
+                    state.depth++;
+                }
+                else
                 {
-                    t_max     = t;
-                    normal    = { 1, 0, 0 };
-                    hit_color = { 0.8f, 0.2f, 0.2f };
+                    // Background (Black for Cornell Box)
+                    state.active = false;
                 }
-            }
-
-            // Right Wall (x = 5)
-            if(ray.direction.x > 0.0f)
-            {
-                float t = (5.0f - ray.origin.x) / ray.direction.x;
-                if(t > 0 && t < t_max)
-                {
-                    t_max     = t;
-                    normal    = { -1, 0, 0 };
-                    hit_color = { 0.2f, 0.2f, 0.8f };
-                }
-            }
-
-            // Back Wall (z = 10)
-            if(ray.direction.z > 0.0f)
-            {
-                float t = (10.0f - ray.origin.z) / ray.direction.z;
-                if(t > 0 && t < t_max)
-                {
-                    t_max     = t;
-                    normal    = { 0, 0, -1 };
-                    hit_color = { 0.8f, 0.8f, 0.8f };
-                }
-            }
-
-            // Shading
-            if(t_max < ray.t_max)
-            {
-                // Hardcoded directional light
-                Vector3f light_dir = Vector3f { 0.0f, 1.0f, -1.0f }.normalize();
-                // Lambertian reflection
-                float    ndotl     = std::max(0.1f, normal.dot(light_dir));
-                ray.color          = hit_color * ndotl;
-            }
-            else
-            {
-                // Ambient background color
-                ray.color = { 0.05f, 0.05f, 0.05f };
-            }
-        });
+            });
     }
 };
 
-/*
- * Shio: Converts the floating-point colors to 32-bit integers (0xRRGGBB)
- * and writes them to the canvas buffer for display.
- */
 struct SystemRenderGDICanvas
 {
     void update(auto && entities, auto && services)
     {
         auto & canvas = services.template get<ServiceGDICanvasProvider>();
+        float scale = 1.0f / (float)std::max(1, canvas.frame_count);
 
-        entities.template query<ComponentPixel, ComponentRay>()(
-            [&](ComponentPixel & pixel, ComponentRay & ray) {
-                // Tone mapping / clamping
-                uint8_t r = static_cast<uint8_t>(
-                    std::min(ray.color.x * 255.0f, 255.0f));
-                uint8_t g = static_cast<uint8_t>(
-                    std::min(ray.color.y * 255.0f, 255.0f));
-                uint8_t b = static_cast<uint8_t>(
-                    std::min(ray.color.z * 255.0f, 255.0f));
+        entities.template query<ComponentPixel, ComponentPathState>()(
+            [&](ComponentPixel & pixel, ComponentPathState & state) {
+                
+                // Average samples
+                Color3f color = state.accumulated_radiance * scale; 
+                
+                // Simple Gamma Correction (approximate sqrt)
+                float r_f = std::sqrt(color.x);
+                float g_f = std::sqrt(color.y);
+                float b_f = std::sqrt(color.z);
 
-                // Write to linear buffer: y * width + x
+                uint8_t r = static_cast<uint8_t>(std::clamp(r_f * 255.0f, 0.0f, 255.0f));
+                uint8_t g = static_cast<uint8_t>(std::clamp(g_f * 255.0f, 0.0f, 255.0f));
+                uint8_t b = static_cast<uint8_t>(std::clamp(b_f * 255.0f, 0.0f, 255.0f));
+
                 canvas.pixel_buffer[pixel.y * canvas.width + pixel.x] =
                     (r << 16) | (g << 8) | b;
             });
     }
 };
+
 } // namespace RT
