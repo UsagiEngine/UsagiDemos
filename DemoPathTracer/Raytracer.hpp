@@ -316,68 +316,66 @@ struct ServiceScene
  */
 struct SystemGenerateCameraRays
 {
-    using WriteComponent =
-        Usagi::ComponentList<ComponentRay, ComponentPathState>;
-    using ReadComponent = Usagi::ComponentList<ComponentPixel>;
-    using WriteService =
-        Usagi::ComponentList<ServiceGDICanvasProvider, ServiceRayQueue>;
+    using WriteComponent = Usagi::ComponentList<ComponentRay, ComponentPathState>;
+    using ReadComponent  = Usagi::ComponentList<ComponentPixel>;
+    using WriteService   = Usagi::ComponentList<ServiceGDICanvasProvider, ServiceRayQueue>;
+    using ReadService    = Usagi::ComponentList<ServiceScheduler>;
 
     void update(auto && entities, auto && services)
     {
         auto & canvas    = services.template get<ServiceGDICanvasProvider>();
         auto & ray_queue = services.template get<ServiceRayQueue>();
+        auto & scheduler = services.template get<ServiceScheduler>();
 
         canvas.frame_count++;
 
-        ray_queue.queue.clear();
+        Vector3f cam_pos      = { 0.0f, 5.0f, -18.0f }; // Moved back to see full box
+        float    aspect_ratio = static_cast<float>(canvas.width) / static_cast<float>(canvas.height);
+
         size_t count = entities.size();
-        for(size_t i = 0; i < count; ++i)
-        {
-            ray_queue.queue.push_back(static_cast<uint32_t>(i));
-        }
+        ray_queue.queue.resize(count);
 
-        Vector3f cam_pos = { 0.0f, 5.0f, -18.0f }; // Moved back to see full box
-        float    aspect_ratio = static_cast<float>(canvas.width) /
-            static_cast<float>(canvas.height);
+        auto pixels = entities.template get_array<ComponentPixel>();
+        auto rays   = entities.template get_array<ComponentRay>();
+        auto states = entities.template get_array<ComponentPathState>();
 
-        entities
-            .template query<ComponentPixel, ComponentRay, ComponentPathState>()(
-                [&](ComponentPixel &     pixel,
-                    ComponentRay &       ray,
-                    ComponentPathState & state) {
-                    // Initialize RNG once per pixel
-                    if(state.rng.state == 0)
-                    {
-                        state.rng.seed(pixel.y * canvas.width + pixel.x + 1);
-                    }
+        scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
+            for(size_t i = start; i < end; ++i)
+            {
+                ray_queue.queue[i] = static_cast<uint32_t>(i);
 
-                    // Jitter for anti-aliasing
-                    float u = (pixel.x + state.rng.next_float()) /
-                        (float)canvas.width;
-                    float v = (pixel.y + state.rng.next_float()) /
-                        (float)canvas.height;
+                auto & pixel = pixels[i];
+                auto & ray   = rays[i];
+                auto & state = states[i];
 
-                    // NDC to Camera Space
-                    float px = (2.0f * u - 1.0f) * aspect_ratio;
-                    float py = 1.0f - 2.0f * v;
+                // Initialize RNG once per pixel
+                if(state.rng.state == 0)
+                {
+                    state.rng.seed(pixel.y * canvas.width + pixel.x + 1);
+                }
 
-                    ray.origin    = cam_pos;
-                    ray.direction = Vector3f { px, py, 1.0f }
-                                        .normalize(); // looking down +Z
-                    ray.t_max = 1000.0f;
+                // Jitter for anti-aliasing
+                float u = (pixel.x + state.rng.next_float()) / (float)canvas.width;
+                float v = (pixel.y + state.rng.next_float()) / (float)canvas.height;
 
-                    // Reset path state for new sample
-                    state.throughput = { 1.0f, 1.0f, 1.0f };
+                // NDC to Camera Space
+                float px = (2.0f * u - 1.0f) * aspect_ratio;
+                float py = 1.0f - 2.0f * v;
 
-                    // For progressive rendering: only clear accumulation on the
-                    // first frame. If the user wants to restart, they would
-                    // reset frame_count.
-                    if(canvas.frame_count == 1)
-                        state.accumulated_radiance = { 0, 0, 0 };
+                ray.origin    = cam_pos;
+                ray.direction = Vector3f { px, py, 1.0f }.normalize();
+                ray.t_max     = 1000.0f;
 
-                    state.depth  = 0;
-                    state.active = true;
-                });
+                // Reset path state for new sample
+                state.throughput = { 1.0f, 1.0f, 1.0f };
+
+                if(canvas.frame_count == 1)
+                    state.accumulated_radiance = { 0, 0, 0 };
+
+                state.depth  = 0;
+                state.active = true;
+            }
+        });
     }
 };
 
@@ -385,6 +383,7 @@ struct SystemGenerateCameraRays
  * Shio: The core path tracing logic.
  * Performs one bounce per update call and uses deferred tasks for cyclic
  * execution.
+ * Now fully data-parallel across the ray queue.
  */
 struct SystemPathBounce
 {
@@ -401,52 +400,68 @@ struct SystemPathBounce
         auto & scheduler = services.template get<ServiceScheduler>();
 
         ray_queue.next_queue.clear();
+        size_t count = ray_queue.queue.size();
+        if(count == 0) return;
 
         auto rays   = entities.template get_array<ComponentRay>();
         auto states = entities.template get_array<ComponentPathState>();
 
-        for(uint32_t id : ray_queue.queue)
-        {
-            auto & ray   = rays[id];
-            auto & state = states[id];
+        std::mutex merge_mutex;
 
-            if(!state.active) continue;
+        scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
+            std::vector<uint32_t> local_next;
+            local_next.reserve(end - start);
 
-            auto hit = scene.intersect(ray.origin, ray.direction, ray.t_max);
-
-            if(hit)
+            for(size_t i = start; i < end; ++i)
             {
-                const auto & mat = scene.materials[hit->material_index];
+                uint32_t id  = ray_queue.queue[i];
+                auto & ray   = rays[id];
+                auto & state = states[id];
 
-                // Emissive contribution
-                state.accumulated_radiance += state.throughput * mat.emission;
+                if(!state.active) continue;
 
-                // Scatter
-                if(mat.type == MaterialType::Light || state.depth >= 5)
+                auto hit = scene.intersect(ray.origin, ray.direction, ray.t_max);
+
+                if(hit)
                 {
-                    state.active = false;
-                    continue;
+                    const auto & mat = scene.materials[hit->material_index];
+
+                    // Emissive contribution
+                    state.accumulated_radiance += state.throughput * mat.emission;
+
+                    // Scatter
+                    if(mat.type == MaterialType::Light || state.depth >= 5)
+                    {
+                        state.active = false;
+                        continue;
+                    }
+
+                    // Lambertian Scatter
+                    Vector3f target = hit->point + hit->normal +
+                        random_in_unit_sphere(state.rng).normalize();
+
+                    ray.origin    = hit->point;
+                    ray.direction = (target - hit->point).normalize();
+                    ray.t_max     = 1000.0f;
+
+                    state.throughput = state.throughput * mat.albedo;
+                    state.depth++;
+
+                    local_next.push_back(id);
                 }
-
-                // Lambertian Scatter
-                Vector3f target = hit->point + hit->normal +
-                    random_in_unit_sphere(state.rng).normalize();
-
-                ray.origin    = hit->point;
-                ray.direction = (target - hit->point).normalize();
-                ray.t_max     = 1000.0f;
-
-                state.throughput = state.throughput * mat.albedo;
-                state.depth++;
-
-                ray_queue.next_queue.push_back(id);
+                else
+                {
+                    // Background (Black for Cornell Box)
+                    state.active = false;
+                }
             }
-            else
+
+            if(!local_next.empty())
             {
-                // Background (Black for Cornell Box)
-                state.active = false;
+                std::lock_guard<std::mutex> lock(merge_mutex);
+                ray_queue.next_queue.insert(ray_queue.next_queue.end(), local_next.begin(), local_next.end());
             }
-        }
+        });
 
         if(!ray_queue.next_queue.empty())
         {
@@ -461,17 +476,26 @@ struct SystemPathBounce
 
 struct SystemRenderGDICanvas
 {
-    using ReadComponent =
-        Usagi::ComponentList<ComponentPixel, ComponentPathState>;
-    using WriteService = Usagi::ComponentList<ServiceGDICanvasProvider>;
+    using ReadComponent  = Usagi::ComponentList<ComponentPixel, ComponentPathState>;
+    using WriteService   = Usagi::ComponentList<ServiceGDICanvasProvider>;
+    using ReadService    = Usagi::ComponentList<ServiceScheduler>;
 
     void update(auto && entities, auto && services)
     {
-        auto & canvas = services.template get<ServiceGDICanvasProvider>();
-        float  scale  = 1.0f / (float)std::max(1, canvas.frame_count.load());
+        auto & canvas    = services.template get<ServiceGDICanvasProvider>();
+        auto & scheduler = services.template get<ServiceScheduler>();
+        float  scale     = 1.0f / (float)std::max(1, canvas.frame_count.load());
 
-        entities.template query<ComponentPixel, ComponentPathState>()(
-            [&](ComponentPixel & pixel, ComponentPathState & state) {
+        size_t count = entities.size();
+        auto pixels  = entities.template get_array<ComponentPixel>();
+        auto states  = entities.template get_array<ComponentPathState>();
+
+        scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
+            for(size_t i = start; i < end; ++i)
+            {
+                auto & pixel = pixels[i];
+                auto & state = states[i];
+
                 // Average samples
                 Color3f color = state.accumulated_radiance * scale;
 
@@ -480,16 +504,13 @@ struct SystemRenderGDICanvas
                 float g_f = std::sqrt(color.y);
                 float b_f = std::sqrt(color.z);
 
-                uint8_t r = static_cast<uint8_t>(
-                    std::clamp(r_f * 255.0f, 0.0f, 255.0f));
-                uint8_t g = static_cast<uint8_t>(
-                    std::clamp(g_f * 255.0f, 0.0f, 255.0f));
-                uint8_t b = static_cast<uint8_t>(
-                    std::clamp(b_f * 255.0f, 0.0f, 255.0f));
+                uint8_t r = static_cast<uint8_t>(std::clamp(r_f * 255.0f, 0.0f, 255.0f));
+                uint8_t g = static_cast<uint8_t>(std::clamp(g_f * 255.0f, 0.0f, 255.0f));
+                uint8_t b = static_cast<uint8_t>(std::clamp(b_f * 255.0f, 0.0f, 255.0f));
 
-                canvas.pixel_buffer[pixel.y * canvas.width + pixel.x] =
-                    (r << 16) | (g << 8) | b;
-            });
+                canvas.pixel_buffer[pixel.y * canvas.width + pixel.x] = (r << 16) | (g << 8) | b;
+            }
+        });
     }
 };
 

@@ -20,9 +20,9 @@ namespace Usagi
 /*
  * Shio:
  * TaskGraphExecutionHost acts as the primary scheduler.
- * It analyzes static read/write permissions of registered systems to build
- * a Directed Acyclic Graph (DAG) for parallel execution. It also provides
- * a deferred task queue to gracefully handle cyclic requests.
+ * It builds a Directed Acyclic Graph (DAG) for parallel system execution
+ * and provides a deferred task queue for cyclic requests.
+ * It also supports data-parallelism via `parallel_for`.
  */
 class TaskGraphExecutionHost
 {
@@ -33,16 +33,16 @@ class TaskGraphExecutionHost
         std::vector<size_t>   read_deps;
         std::vector<size_t>   dependents;
         size_t                initial_dependencies    = 0;
-        std::atomic<size_t>   unresolved_dependencies = 0;
+        std::atomic<size_t>   unresolved_dependencies { 0 };
     };
 
     std::deque<SystemNode>   nodes;
     std::vector<std::thread> workers;
     std::atomic<bool>        running { true };
 
-    std::mutex              queue_mutex;
-    std::condition_variable queue_cv;
-    std::vector<size_t>     ready_queue;
+    std::mutex                        task_mutex;
+    std::condition_variable           task_cv;
+    std::deque<std::function<void()>> task_queue;
 
     std::atomic<size_t>     completed_nodes { 0 };
     std::mutex              completion_mutex;
@@ -53,8 +53,6 @@ class TaskGraphExecutionHost
 
     /*
      * Shio: Unified resource ID generator.
-     * Both Components and Services map into this same ID space to detect
-     * read/write conflicts globally.
      */
     inline static std::atomic<size_t> next_resource_id { 0 };
 
@@ -101,35 +99,38 @@ class TaskGraphExecutionHost
     {
         while(running)
         {
-            size_t node_index;
+            std::function<void()> task;
             {
-                std::unique_lock<std::mutex> lock(queue_mutex);
-                queue_cv.wait(
-                    lock, [this] { return !ready_queue.empty() || !running; });
+                std::unique_lock<std::mutex> lock(task_mutex);
+                task_cv.wait(lock, [this] { return !task_queue.empty() || !running; });
 
-                if(!running && ready_queue.empty()) return;
+                if(!running && task_queue.empty()) return;
 
-                node_index = ready_queue.back();
-                ready_queue.pop_back();
+                task = std::move(task_queue.front());
+                task_queue.pop_front();
             }
+            if(task) task();
+        }
+    }
 
-            nodes[node_index].execute_func();
+    void execute_node(size_t node_index)
+    {
+        nodes[node_index].execute_func();
 
-            for(size_t dep_index : nodes[node_index].dependents)
+        for(size_t dep_index : nodes[node_index].dependents)
+        {
+            if(nodes[dep_index].unresolved_dependencies.fetch_sub(1) == 1)
             {
-                if(nodes[dep_index].unresolved_dependencies.fetch_sub(1) == 1)
-                {
-                    std::lock_guard<std::mutex> lock(queue_mutex);
-                    ready_queue.push_back(dep_index);
-                    queue_cv.notify_one();
-                }
+                std::lock_guard<std::mutex> lock(task_mutex);
+                task_queue.push_back([this, dep_index]() { execute_node(dep_index); });
+                task_cv.notify_one();
             }
+        }
 
-            if(completed_nodes.fetch_add(1) + 1 == nodes.size())
-            {
-                std::lock_guard<std::mutex> lock(completion_mutex);
-                completion_cv.notify_one();
-            }
+        if(completed_nodes.fetch_add(1) + 1 == nodes.size())
+        {
+            std::lock_guard<std::mutex> lock(completion_mutex);
+            completion_cv.notify_one();
         }
     }
 
@@ -145,31 +146,24 @@ public:
     ~TaskGraphExecutionHost()
     {
         running = false;
-        queue_cv.notify_all();
+        task_cv.notify_all();
         for(auto & t : workers)
         {
             if(t.joinable()) t.join();
         }
     }
 
-    /*
-     * Shio: Extracts type permissions and registers a system node.
-     */
     template <typename System, typename Entities, typename Services>
     void register_system(System & sys, Entities & entities, Services & services)
     {
-        SystemNode &node = nodes.emplace_back();
+        auto & node = nodes.emplace_back();
         node.execute_func = [&sys, &entities, &services]() {
             sys.update(entities, services);
         };
         fill_write_deps<System>(node.write_deps);
         fill_read_deps<System>(node.read_deps);
-        // nodes.push_back(std::move(node));
     }
 
-    /*
-     * Shio: Evaluates read/write permissions to construct the execution DAG.
-     */
     void build_graph()
     {
         for(auto & node : nodes)
@@ -178,36 +172,27 @@ public:
             node.initial_dependencies = 0;
         }
 
-        // Registration sequence implies priority for resolving conflicts.
         for(size_t i = 0; i < nodes.size(); ++i)
         {
             for(size_t j = i + 1; j < nodes.size(); ++j)
             {
                 bool conflict = false;
 
-                // Case 1: J writes to a resource that I reads or writes
                 for(size_t j_write : nodes[j].write_deps)
                 {
-                    if(std::find(nodes[i].write_deps.begin(),
-                           nodes[i].write_deps.end(),
-                           j_write) != nodes[i].write_deps.end() ||
-                        std::find(nodes[i].read_deps.begin(),
-                            nodes[i].read_deps.end(),
-                            j_write) != nodes[i].read_deps.end())
+                    if(std::find(nodes[i].write_deps.begin(), nodes[i].write_deps.end(), j_write) != nodes[i].write_deps.end() ||
+                       std::find(nodes[i].read_deps.begin(), nodes[i].read_deps.end(), j_write) != nodes[i].read_deps.end())
                     {
                         conflict = true;
                         break;
                     }
                 }
 
-                // Case 2: J reads a resource that I writes
                 if(!conflict)
                 {
                     for(size_t j_read : nodes[j].read_deps)
                     {
-                        if(std::find(nodes[i].write_deps.begin(),
-                               nodes[i].write_deps.end(),
-                               j_read) != nodes[i].write_deps.end())
+                        if(std::find(nodes[i].write_deps.begin(), nodes[i].write_deps.end(), j_read) != nodes[i].write_deps.end())
                         {
                             conflict = true;
                             break;
@@ -224,14 +209,76 @@ public:
         }
     }
 
-    /*
-     * Shio: Systems can submit lambda closures to request indirect tasks.
-     * Evaluated synchronously after the DAG completes.
-     */
     void submit_deferred_task(std::function<void()> task)
     {
         std::lock_guard<std::mutex> lock(deferred_mutex);
         deferred_tasks.push_back(std::move(task));
+    }
+
+    /*
+     * Shio: Distributes data-parallel work across the worker thread pool.
+     * Blocks the caller until all chunks complete, actively helping to drain the task queue
+     * to avoid deadlocks and maximize throughput.
+     */
+    template <typename F>
+    void parallel_for(size_t count, size_t chunk_size, F && func)
+    {
+        if(count == 0) return;
+        size_t num_chunks = (count + chunk_size - 1) / chunk_size;
+
+        std::atomic<size_t> next_chunk { 0 };
+        size_t pushed_tasks = std::min(num_chunks, workers.size());
+        std::atomic<size_t> active_tasks { pushed_tasks };
+
+        auto worker_func = [&]() {
+            while(true)
+            {
+                size_t chunk = next_chunk.fetch_add(1);
+                if(chunk >= num_chunks) break;
+
+                size_t start = chunk * chunk_size;
+                size_t end   = std::min(start + chunk_size, count);
+                func(start, end);
+            }
+            active_tasks.fetch_sub(1);
+        };
+
+        {
+            std::lock_guard<std::mutex> lock(task_mutex);
+            // Submit tasks up to the number of workers we have
+            for(size_t i = 0; i < pushed_tasks; ++i)
+            {
+                task_queue.push_back(worker_func);
+            }
+        }
+        task_cv.notify_all();
+
+        // The calling thread joins in
+        while(true)
+        {
+            size_t chunk = next_chunk.fetch_add(1);
+            if(chunk >= num_chunks) break;
+
+            size_t start = chunk * chunk_size;
+            size_t end   = std::min(start + chunk_size, count);
+            func(start, end);
+        }
+
+        // Wait for all pushed tasks to complete to avoid dangling references
+        while(active_tasks.load() > 0)
+        {
+            std::function<void()> stolen_task;
+            {
+                std::lock_guard<std::mutex> lock(task_mutex);
+                if(!task_queue.empty())
+                {
+                    stolen_task = std::move(task_queue.front());
+                    task_queue.pop_front();
+                }
+            }
+            if(stolen_task) stolen_task();
+            else std::this_thread::yield();
+        }
     }
 
     void execute()
@@ -241,29 +288,24 @@ public:
         completed_nodes = 0;
 
         {
-            std::lock_guard<std::mutex> lock(queue_mutex);
-            ready_queue.clear();
+            std::lock_guard<std::mutex> lock(task_mutex);
             for(size_t i = 0; i < nodes.size(); ++i)
             {
-                nodes[i].unresolved_dependencies =
-                    nodes[i].initial_dependencies;
+                nodes[i].unresolved_dependencies = nodes[i].initial_dependencies;
                 if(nodes[i].initial_dependencies == 0)
                 {
-                    ready_queue.push_back(i);
+                    task_queue.push_back([this, i]() { execute_node(i); });
                 }
             }
         }
 
-        queue_cv.notify_all();
+        task_cv.notify_all();
 
-        // Wait for primary multi-threaded DAG evaluation
         {
             std::unique_lock<std::mutex> lock(completion_mutex);
-            completion_cv.wait(
-                lock, [this] { return completed_nodes == nodes.size(); });
+            completion_cv.wait(lock, [this] { return completed_nodes == nodes.size(); });
         }
 
-        // Drain deferred tasks resolving cyclic queries
         while(true)
         {
             std::vector<std::function<void()>> current_deferred;
