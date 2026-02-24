@@ -161,6 +161,7 @@ struct Material
     Color3f      emission;
     float        roughness; // For Metal / Translucent
     float        ior;       // Index of Refraction for Translucent
+    bool         is_moon = false;
 };
 
 struct HitRecord
@@ -169,6 +170,7 @@ struct HitRecord
     Vector3f point;
     Normal3f normal;
     int      material_index;
+    Vector3f obj_center;
 };
 
 struct Sphere
@@ -490,60 +492,86 @@ struct ServiceScene
     std::vector<Box>      boxes;
     std::vector<Material> materials;
     Vector3f              sun_dir = {0, 1, 0};
+    Vector3f              moon_dir = {0, -1, 0};
+
+    Color3f evaluate_emission(const Material& mat, const Vector3f& p, const Vector3f& center) const {
+        if (!mat.is_moon) return mat.emission;
+        
+        // Procedural craters/surface noise
+        Vector3f local = (p - center).normalize();
+        float n = std::sin(local.x * 30.0f) * std::cos(local.y * 30.0f) * std::sin(local.z * 30.0f);
+        n += 0.5f * std::sin(local.x * 60.0f + local.y * 60.0f);
+        float noise = (n + 1.5f) * 0.4f;
+        noise = std::clamp(noise, 0.4f, 1.0f); // Prevents the moon from having jet-black voids
+        
+        return mat.emission * noise;
+    }
 
     Color3f evaluate_sky(const Vector3f& view_dir) const {
-        float cos_theta = view_dir.dot(sun_dir);
-        float rayleigh_phase = 0.75f * (1.0f + cos_theta * cos_theta);
-        
-        float g = 0.98f;
-        float mie_phase = 1.5f * ((1.0f - g*g) / (2.0f + g*g)) * (1.0f + cos_theta*cos_theta) / std::pow(1.0f + g*g - 2.0f*g*cos_theta + 0.001f, 1.5f);
-
-        Vector3f beta_r = {0.0038f, 0.0135f, 0.0331f}; 
-        Vector3f beta_m = {0.0210f, 0.0210f, 0.0210f};
-
-        float v_y = std::max(0.001f, view_dir.y);
-        float s_y = std::max(0.001f, sun_dir.y);
-
-        float opt_depth_v = 1.0f / v_y;
-        float opt_depth_s = 1.0f / s_y;
-
-        // Total scattering coefficient sum
-        Vector3f beta_sum = { beta_r.x + beta_m.x, beta_r.y + beta_m.y, beta_r.z + beta_m.z };
-
-        Vector3f tau = {
-            beta_sum.x * (opt_depth_v + opt_depth_s) * 5.0f,
-            beta_sum.y * (opt_depth_v + opt_depth_s) * 5.0f,
-            beta_sum.z * (opt_depth_v + opt_depth_s) * 5.0f
-        };
-        Vector3f attenuation = { std::exp(-tau.x), std::exp(-tau.y), std::exp(-tau.z) };
-
-        Vector3f scatter = {
-            (beta_r.x * rayleigh_phase + beta_m.x * mie_phase),
-            (beta_r.y * rayleigh_phase + beta_m.y * mie_phase),
-            (beta_r.z * rayleigh_phase + beta_m.z * mie_phase)
-        };
-        
-        // Zero out sky beneath the horizon so we don't see a bright blue floor
         if (view_dir.y <= 0.0f) return {0,0,0};
 
-        // Proper physically-based in-scattering equation:
-        // L = (Scatter / Beta_sum) * (1 - exp(-tau))
-        Vector3f sky = {
-            (scatter.x / beta_sum.x) * (1.0f - attenuation.x),
-            (scatter.y / beta_sum.y) * (1.0f - attenuation.y),
-            (scatter.z / beta_sum.z) * (1.0f - attenuation.z)
-        };
-        
-        // The sky itself also receives less light as the sun sets, so we must multiply by the sun's raw attenuation!
-        Vector3f sun_tau = { beta_sum.x * opt_depth_s * 5.0f, beta_sum.y * opt_depth_s * 5.0f, beta_sum.z * opt_depth_s * 5.0f };
-        Vector3f sun_attenuation = { std::exp(-sun_tau.x), std::exp(-sun_tau.y), std::exp(-sun_tau.z) };
-        
-        // Add a small ambient floor so night isn't pure #000000
-        sky.x = sky.x * sun_attenuation.x * 20.0f + 0.01f;
-        sky.y = sky.y * sun_attenuation.y * 20.0f + 0.02f;
-        sky.z = sky.z * sun_attenuation.z * 20.0f + 0.05f;
+        auto calc_sky_for_light = [&](const Vector3f& l_dir, const Color3f& intensity) -> Color3f {
+            if (l_dir.y <= 0.0f) return {0,0,0};
+            float cos_theta = view_dir.dot(l_dir);
+            float rayleigh_phase = 0.75f * (1.0f + cos_theta * cos_theta);
+            
+            float g = 0.98f;
+            float mie_phase = 1.5f * ((1.0f - g*g) / (2.0f + g*g)) * (1.0f + cos_theta*cos_theta) / std::pow(1.0f + g*g - 2.0f*g*cos_theta + 0.001f, 1.5f);
 
-        return sky;
+            Vector3f beta_r = {0.0038f, 0.0135f, 0.0331f}; 
+            Vector3f beta_m = {0.0210f, 0.0210f, 0.0210f};
+
+            float v_y = std::max(0.001f, view_dir.y);
+            float s_y = std::max(0.001f, l_dir.y);
+
+            float opt_depth_v = 1.0f / v_y;
+            float opt_depth_s = 1.0f / s_y;
+
+            // Total scattering coefficient sum
+            Vector3f beta_sum = { beta_r.x + beta_m.x, beta_r.y + beta_m.y, beta_r.z + beta_m.z };
+
+            Vector3f tau = {
+                beta_sum.x * (opt_depth_v + opt_depth_s) * 5.0f,
+                beta_sum.y * (opt_depth_v + opt_depth_s) * 5.0f,
+                beta_sum.z * (opt_depth_v + opt_depth_s) * 5.0f
+            };
+            Vector3f attenuation = { std::exp(-tau.x), std::exp(-tau.y), std::exp(-tau.z) };
+
+            Vector3f scatter = {
+                (beta_r.x * rayleigh_phase + beta_m.x * mie_phase),
+                (beta_r.y * rayleigh_phase + beta_m.y * mie_phase),
+                (beta_r.z * rayleigh_phase + beta_m.z * mie_phase)
+            };
+            
+            // Proper physically-based in-scattering equation
+            Vector3f sky = {
+                (scatter.x / beta_sum.x) * (1.0f - attenuation.x),
+                (scatter.y / beta_sum.y) * (1.0f - attenuation.y),
+                (scatter.z / beta_sum.z) * (1.0f - attenuation.z)
+            };
+            
+            // The sky itself also receives less light as the light source sets
+            Vector3f l_tau = { beta_sum.x * opt_depth_s * 5.0f, beta_sum.y * opt_depth_s * 5.0f, beta_sum.z * opt_depth_s * 5.0f };
+            Vector3f l_attenuation = { std::exp(-l_tau.x), std::exp(-l_tau.y), std::exp(-l_tau.z) };
+            
+            return {
+                sky.x * l_attenuation.x * intensity.x,
+                sky.y * l_attenuation.y * intensity.y,
+                sky.z * l_attenuation.z * intensity.z
+            };
+        };
+
+        Color3f sun_sky = calc_sky_for_light(sun_dir, {20.0f, 20.0f, 20.0f});
+        Color3f moon_sky = calc_sky_for_light(moon_dir, {0.2f, 0.24f, 0.3f}); // Much dimmer moonlight
+
+        Color3f total_sky = sun_sky + moon_sky;
+
+        // Add a small ambient floor so night isn't pure #000000
+        total_sky.x += 0.01f;
+        total_sky.y += 0.02f;
+        total_sky.z += 0.05f;
+
+        return total_sky;
     }
 
     std::optional<HitRecord> intersect(
@@ -561,6 +589,7 @@ struct ServiceScene
                 rec.point          = o + d * rec.t;
                 rec.normal         = (rec.point - s.center).normalize();
                 rec.material_index = s.material_index;
+                rec.obj_center     = s.center;
                 hit_anything       = true;
             }
         }
@@ -573,6 +602,7 @@ struct ServiceScene
                 rec.point          = o + d * rec.t;
                 rec.normal         = b.get_normal(rec.point);
                 rec.material_index = b.material_index;
+                rec.obj_center     = b.min + (b.max - b.min) * 0.5f;
                 hit_anything       = true;
             }
         }
@@ -582,18 +612,34 @@ struct ServiceScene
     }
 
     bool sample_light(SamplerPCG32& rng, Vector3f& p, Normal3f& n, Color3f& emission, float& pdf) const {
+        int light_count = 0;
+        for (const auto& s : spheres) if (materials[s.material_index].type == MaterialType::Light) light_count++;
+        for (const auto& b : boxes) if (materials[b.material_index].type == MaterialType::Light) light_count++;
+        
+        if (light_count == 0) return false;
+
+        int light_idx = std::min((int)(rng.next_float() * light_count), light_count - 1);
+        
+        int current_idx = 0;
         for (const auto& s : spheres) {
             if (materials[s.material_index].type == MaterialType::Light) {
-                s.sample_surface(rng, p, n, pdf);
-                emission = materials[s.material_index].emission;
-                return true;
+                if (current_idx++ == light_idx) {
+                    s.sample_surface(rng, p, n, pdf);
+                    pdf /= light_count; // Scale pdf by uniform choice probability
+                    emission = evaluate_emission(materials[s.material_index], p, s.center);
+                    return true;
+                }
             }
         }
         for (const auto& b : boxes) {
             if (materials[b.material_index].type == MaterialType::Light) {
-                b.sample_surface(rng, p, n, pdf);
-                emission = materials[b.material_index].emission;
-                return true;
+                if (current_idx++ == light_idx) {
+                    b.sample_surface(rng, p, n, pdf);
+                    pdf /= light_count;
+                    Vector3f center = b.min + (b.max - b.min) * 0.5f;
+                    emission = evaluate_emission(materials[b.material_index], p, center);
+                    return true;
+                }
             }
         }
         return false;
@@ -1149,9 +1195,11 @@ struct SystemEvaluateLight
                 if (state_svc.pass == 1) { // Removed last_bounce_specular check to cover diffuse direct hits
                     auto & cpath = cpaths[id];
                     
+                    Color3f emission = scene.evaluate_emission(mat, hit.point, hit.obj_center);
+
                     if (cpath.count == 0) {
                         // Pure direct hits bypass MIS and go straight to the direct buffer!
-                        film.add_sample(state.sample_x, state.sample_y, state.radiance + state.throughput * mat.emission, true);
+                        film.add_sample(state.sample_x, state.sample_y, state.radiance + state.throughput * emission, true);
                     } else {
                         PathVertex path[MAX_PATH_DEPTH + 1];
                         path[0] = {hit.point, hit.normal, {1,1,1}, {PI,PI,PI}, false};
@@ -1162,7 +1210,7 @@ struct SystemEvaluateLight
                         float light_area = scene.get_light_area();
                         float mis_weight = compute_mis_weight(path, cpath.count + 1, 0, light_area);
                         
-                        cpath.direct_emission = state.throughput * mat.emission * mis_weight;
+                        cpath.direct_emission = state.throughput * emission * mis_weight;
                     }
                 }
                 state.active = false;
@@ -1287,11 +1335,13 @@ struct SystemPathTracingCoordinator
             
             // Sun orbits in YZ plane. Z > 0 is out the back wall.
             scene.sun_dir = Vector3f{ 0.0f, std::cos(time), std::sin(time) }.normalize();
+            // Moon orbits offset in phase and tilted slightly in X so they never collide
+            scene.moon_dir = Vector3f{ 0.3f, std::cos(time + PI), std::sin(time + PI) }.normalize();
             
-            if (!scene.spheres.empty()) {
+            if (scene.spheres.size() >= 2) {
+                // Sphere 0 is the Sun
                 scene.spheres[0].center = scene.sun_dir * 1000.0f;
                 
-                // Color sun emission based on atmosphere
                 float s_y = std::max(0.001f, scene.sun_dir.y);
                 float opt_depth_s = 1.0f / s_y;
                 Vector3f tau = {
@@ -1300,18 +1350,32 @@ struct SystemPathTracingCoordinator
                     0.0331f * opt_depth_s * 5.0f
                 };
                 Vector3f attenuation = { std::exp(-tau.x), std::exp(-tau.y), std::exp(-tau.z) };
-                
-                // If the sun dips below the horizon, switch it off entirely.
-                if (scene.sun_dir.y <= 0.0f) {
-                     attenuation = {0.0f, 0.0f, 0.0f};
-                }
+                if (scene.sun_dir.y <= 0.0f) attenuation = {0.0f, 0.0f, 0.0f};
 
-                // Multiply base sun color by atmospheric attenuation
-                // Ensure red (x) drops MUCH slower than blue (z)
                 scene.materials[scene.spheres[0].material_index].emission = {
-                    attenuation.x * 2000.0f, // Boosted to act as a proper main light source
+                    attenuation.x * 2000.0f,
                     attenuation.y * 1000.0f,
                     attenuation.z *  500.0f
+                };
+
+                // Sphere 1 is the Moon
+                scene.spheres[1].center = scene.moon_dir * 1000.0f;
+                
+                float m_y = std::max(0.001f, scene.moon_dir.y);
+                float opt_depth_m = 1.0f / m_y;
+                Vector3f m_tau = {
+                    0.0038f * opt_depth_m * 5.0f, 
+                    0.0135f * opt_depth_m * 5.0f, 
+                    0.0331f * opt_depth_m * 5.0f
+                };
+                Vector3f m_attenuation = { std::exp(-m_tau.x), std::exp(-m_tau.y), std::exp(-m_tau.z) };
+                if (scene.moon_dir.y <= 0.0f) m_attenuation = {0.0f, 0.0f, 0.0f};
+
+                // Base moon color (pale blue/white) properly attenuated by atmosphere
+                scene.materials[scene.spheres[1].material_index].emission = {
+                    m_attenuation.x * 15.0f,
+                    m_attenuation.y * 18.0f,
+                    m_attenuation.z * 22.0f
                 };
             }
 

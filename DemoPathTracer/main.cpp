@@ -102,7 +102,12 @@ void SetupCornellBox(RT::ServiceScene & scene)
     scene.boxes.push_back({ { s, -s, -s }, { s + 1.0f, s, s }, 2 });
 
     // The Sun (Massive light sphere far away)
-    scene.spheres.push_back({ { 0.0f, 0.0f, 1000.0f }, 50.0f, 3 });
+    scene.materials.push_back({ MaterialType::Light, { 1.0f, 1.0f, 1.0f }, { 15.0f, 15.0f, 15.0f }, 0.0f, 1.0f, false });
+    scene.spheres.push_back({ { 0.0f, 0.0f, 1000.0f }, 45.0f, 6 });
+
+    // The Moon (Textured secondary light sphere directly opposed to the Sun)
+    scene.materials.push_back({ MaterialType::Light, { 1.0f, 1.0f, 1.0f }, { 2.0f, 2.2f, 2.5f }, 0.0f, 1.0f, true });
+    scene.spheres.push_back({ { 0.0f, 0.0f, -1000.0f }, 40.0f, 7 });
 
     // Boxes inside
     // Short box
