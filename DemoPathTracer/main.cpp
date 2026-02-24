@@ -143,7 +143,9 @@ int WINAPI WinMain(
     ShowWindow(g_hWnd, nCmdShow);
 
     // Engine Core
-    Usagi::MappedHeap primary_heap(128 * 1'024 * 1'024); // 128MB
+    // Shio: Increased heap size to 2GB to accommodate full BDPT vertex history arrays for 800x600 pixels.
+    // Each pixel needs multiple Vector3f/Color3f vertices.
+    Usagi::MappedHeap primary_heap(2ULL * 1024 * 1024 * 1024); // 2GB
 
     // Systems
     // Note: Systems are stateless or have trivial state for now, so copying or
@@ -157,7 +159,9 @@ int WINAPI WinMain(
     Usagi::ComponentGroup<RT::ComponentPixel,
         RT::ComponentRay,
         RT::ComponentPathState,
-        RT::ComponentRayHit>
+        RT::ComponentRayHit,
+        RT::ComponentCameraPath,
+        RT::ComponentLightPath>
         primary_group(primary_heap, PIXEL_COUNT);
 
     // Services setup
@@ -167,6 +171,9 @@ int WINAPI WinMain(
     gdi_canvas.pixel_buffer = primary_heap.allocate_pod<uint32_t>(PIXEL_COUNT)
                                   .resolve(primary_heap.get_base());
     services.register_service(&gdi_canvas);
+
+    RT::ServiceRenderState render_state;
+    services.register_service(&render_state);
 
     RT::ServiceFilm film;
     film.init(WIDTH, HEIGHT, 2.0f, 2.0f);
@@ -204,12 +211,14 @@ int WINAPI WinMain(
         Usagi::TaskGraphExecutionHost host(std::thread::hardware_concurrency());
         scheduler.host = &host;
 
-        RT::SystemGenerateCameraRays     sys_gen_rays;
+        RT::SystemGenerateRays           sys_gen_rays;
         RT::SystemPathTracingCoordinator sys_coord;
+        RT::SystemConnectPaths           sys_conn;
         RT::SystemRenderGDICanvas        sys_render;
 
         host.register_system(sys_gen_rays, primary_group, services);
         host.register_system(sys_coord, primary_group, services);
+        host.register_system(sys_conn, primary_group, services);
         host.register_system(sys_render, primary_group, services);
 
         host.build_graph();

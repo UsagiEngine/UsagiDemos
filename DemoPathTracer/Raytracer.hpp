@@ -288,6 +288,28 @@ struct ComponentPixel
     int x, y;
 };
 
+constexpr int MAX_PATH_DEPTH = 5;
+
+struct PathVertex {
+    Vector3f p;
+    Normal3f n;
+    Color3f  beta;
+    Color3f  albedo;
+    bool     is_delta;
+};
+
+struct ComponentCameraPath {
+    PathVertex vertices[MAX_PATH_DEPTH];
+    int count = 0;
+    Color3f direct_emission = {0,0,0};
+    int direct_depth = 0;
+};
+
+struct ComponentLightPath {
+    PathVertex vertices[MAX_PATH_DEPTH];
+    int count = 0;
+};
+
 /*
  * Shio: Holds the path tracing state for a single sample.
  * Allows the ray to 'pause' and 'resume' between system updates (bounces).
@@ -311,6 +333,11 @@ struct ComponentPathState
 struct ServiceScheduler
 {
     Usagi::TaskGraphExecutionHost * host = nullptr;
+};
+
+struct ServiceRenderState
+{
+    int pass = 0; // 0: InitCam, 1: BounceCam, 2: InitLight, 3: BounceLight, 4: Connect
 };
 
 struct ServiceRayQueue
@@ -459,22 +486,26 @@ struct ServiceScene
 // -----------------------------------------------------------------------------
 
 /*
- * Shio: Initializes rays for the start of a frame (or a new sample).
+ * Shio: Initializes rays for Camera (pass=0) or Light (pass=2).
  */
-struct SystemGenerateCameraRays
+struct SystemGenerateRays
 {
-    using WriteComponent = Usagi::ComponentList<ComponentRay, ComponentPathState>;
+    using WriteComponent = Usagi::ComponentList<ComponentRay, ComponentPathState, ComponentCameraPath, ComponentLightPath>;
     using ReadComponent  = Usagi::ComponentList<ComponentPixel>;
     using WriteService   = Usagi::ComponentList<ServiceGDICanvasProvider, ServiceRayQueue>;
-    using ReadService    = Usagi::ComponentList<ServiceScheduler>;
+    using ReadService    = Usagi::ComponentList<ServiceScheduler, ServiceRenderState, ServiceScene>;
 
     void update(auto && entities, auto && services)
     {
+        auto & state_svc = services.template get<ServiceRenderState>();
+        if (state_svc.pass != 0 && state_svc.pass != 2) return;
+
         auto & canvas    = services.template get<ServiceGDICanvasProvider>();
         auto & ray_queue = services.template get<ServiceRayQueue>();
         auto & scheduler = services.template get<ServiceScheduler>();
+        auto & scene     = services.template get<ServiceScene>();
 
-        canvas.frame_count++;
+        if (state_svc.pass == 0) canvas.frame_count++;
 
         Vector3f cam_pos      = { 0.0f, 5.0f, -18.0f }; // Moved back to see full box
         float    aspect_ratio = static_cast<float>(canvas.width) / static_cast<float>(canvas.height);
@@ -485,6 +516,10 @@ struct SystemGenerateCameraRays
         auto pixels = entities.template get_array<ComponentPixel>();
         auto rays   = entities.template get_array<ComponentRay>();
         auto states = entities.template get_array<ComponentPathState>();
+        auto cpaths = entities.template get_array<ComponentCameraPath>();
+        auto lpaths = entities.template get_array<ComponentLightPath>();
+
+        bool is_cam = (state_svc.pass == 0);
 
         scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
             for(size_t i = start; i < end; ++i)
@@ -501,29 +536,54 @@ struct SystemGenerateCameraRays
                     state.rng.seed(pixel.y * canvas.width + pixel.x + 1, 1337);
                 }
 
-                // Jitter for anti-aliasing
-                float j_x = state.rng.next_float();
-                float j_y = state.rng.next_float();
-                state.sample_x = pixel.x + j_x;
-                state.sample_y = pixel.y + j_y;
-
-                float u = state.sample_x / (float)canvas.width;
-                float v = state.sample_y / (float)canvas.height;
-
-                // NDC to Camera Space
-                float px = (2.0f * u - 1.0f) * aspect_ratio;
-                float py = 1.0f - 2.0f * v;
-
-                ray.origin    = cam_pos;
-                ray.direction = Vector3f { px, py, 1.0f }.normalize();
-                ray.t_max     = 1000.0f;
-
-                // Reset path state for new sample
                 state.throughput = { 1.0f, 1.0f, 1.0f };
                 state.radiance   = { 0.0f, 0.0f, 0.0f };
                 state.depth      = 0;
                 state.active     = true;
                 state.last_bounce_specular = true;
+
+                if (is_cam) {
+                    // Jitter for anti-aliasing
+                    float j_x = state.rng.next_float();
+                    float j_y = state.rng.next_float();
+                    state.sample_x = pixel.x + j_x;
+                    state.sample_y = pixel.y + j_y;
+
+                    float u = state.sample_x / (float)canvas.width;
+                    float v = state.sample_y / (float)canvas.height;
+
+                    // NDC to Camera Space
+                    float px = (2.0f * u - 1.0f) * aspect_ratio;
+                    float py = 1.0f - 2.0f * v;
+
+                    ray.origin    = cam_pos;
+                    ray.direction = Vector3f { px, py, 1.0f }.normalize();
+                    ray.t_max     = 1000.0f;
+
+                    cpaths[i].count = 0;
+                    cpaths[i].direct_emission = {0,0,0};
+
+                    // Note: In BDPT, camera is theoretically vertex 0.
+                    // We only record surface hits for now.
+                } else {
+                    lpaths[i].count = 0;
+                    Vector3f p; Normal3f n; Color3f e; float pdf;
+                    if (scene.sample_light(state.rng, p, n, e, pdf)) {
+                        state.throughput = e * (1.0f / pdf);
+                        ONB onb; onb.build_from_w(n);
+                        Vector3f dir = onb.local(cosine_sample_hemisphere(state.rng.next_float(), state.rng.next_float()));
+                        
+                        // First light vertex is the point on the light source
+                        lpaths[i].vertices[0] = {p, n, state.throughput, {1,1,1}, false};
+                        lpaths[i].count = 1;
+                        
+                        ray.origin = p + n * 0.001f;
+                        ray.direction = dir.normalize();
+                        ray.t_max = 1000.0f;
+                    } else {
+                        state.active = false;
+                    }
+                }
             }
         });
     }
@@ -617,9 +677,9 @@ struct SystemIntersectRays
  */
 struct SystemEvaluateLambert
 {
-    using WriteComponent = Usagi::ComponentList<ComponentRay, ComponentPathState>;
+    using WriteComponent = Usagi::ComponentList<ComponentRay, ComponentPathState, ComponentCameraPath, ComponentLightPath>;
     using ReadComponent  = Usagi::ComponentList<ComponentRayHit>;
-    using ReadService    = Usagi::ComponentList<ServiceScene>;
+    using ReadService    = Usagi::ComponentList<ServiceScene, ServiceRenderState>;
     using WriteService   = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler>;
 
     void update(auto && entities, auto && services)
@@ -627,13 +687,18 @@ struct SystemEvaluateLambert
         auto & scene     = services.template get<ServiceScene>();
         auto & ray_queue = services.template get<ServiceRayQueue>();
         auto & scheduler = services.template get<ServiceScheduler>();
+        auto & state_svc = services.template get<ServiceRenderState>();
 
         size_t count = ray_queue.q_lambert.size();
         if(count == 0) return;
 
+        bool is_cam = (state_svc.pass == 1);
+
         auto rays   = entities.template get_array<ComponentRay>();
         auto hits   = entities.template get_array<ComponentRayHit>();
         auto states = entities.template get_array<ComponentPathState>();
+        auto cpaths = entities.template get_array<ComponentCameraPath>();
+        auto lpaths = entities.template get_array<ComponentLightPath>();
 
         std::mutex merge_mutex;
 
@@ -648,21 +713,10 @@ struct SystemEvaluateLambert
                 auto & state = states[id];
                 const auto & mat = scene.materials[hit.material_index];
 
-                // NEE: Direct Light Sampling (Bidirectional t=1 connection)
-                Vector3f light_p; Normal3f light_n; Color3f light_e; float light_pdf;
-                if (scene.sample_light(state.rng, light_p, light_n, light_e, light_pdf)) {
-                    Vector3f L = light_p - hit.point;
-                    float dist = L.length();
-                    L = L * (1.0f / dist);
-                    float ndotl = hit.normal.dot(L);
-                    float light_ndotl = -light_n.dot(L);
-                    
-                    if (ndotl > 0.0f && light_ndotl > 0.0f) {
-                        if (!scene.intersect(hit.point + hit.normal * 0.001f, L, dist - 0.002f)) {
-                            float solid_angle_pdf = light_pdf * (dist * dist) / light_ndotl;
-                            state.radiance += state.throughput * mat.albedo * light_e * (ndotl / (PI * solid_angle_pdf));
-                        }
-                    }
+                if (is_cam && cpaths[id].count < MAX_PATH_DEPTH) {
+                    cpaths[id].vertices[cpaths[id].count++] = {hit.point, hit.normal, state.throughput, mat.albedo, false};
+                } else if (!is_cam && lpaths[id].count < MAX_PATH_DEPTH) {
+                    lpaths[id].vertices[lpaths[id].count++] = {hit.point, hit.normal, state.throughput, mat.albedo, false};
                 }
 
                 ONB onb;
@@ -676,7 +730,12 @@ struct SystemEvaluateLambert
                 state.throughput = state.throughput * mat.albedo;
                 state.depth++;
                 state.last_bounce_specular = false;
-                loc_next.push_back(id);
+                
+                if (state.depth < (is_cam ? MAX_PATH_DEPTH : MAX_PATH_DEPTH)) {
+                    loc_next.push_back(id);
+                } else {
+                    state.active = false;
+                }
             }
 
             std::lock_guard<std::mutex> lock(merge_mutex);
@@ -690,24 +749,28 @@ struct SystemEvaluateLambert
  */
 struct SystemEvaluateMetal
 {
-    using WriteComponent = Usagi::ComponentList<ComponentRay, ComponentPathState>;
+    using WriteComponent = Usagi::ComponentList<ComponentRay, ComponentPathState, ComponentCameraPath, ComponentLightPath>;
     using ReadComponent  = Usagi::ComponentList<ComponentRayHit>;
-    using ReadService    = Usagi::ComponentList<ServiceScene>;
-    using WriteService   = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler, ServiceFilm>;
+    using ReadService    = Usagi::ComponentList<ServiceScene, ServiceRenderState>;
+    using WriteService   = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler>;
 
     void update(auto && entities, auto && services)
     {
         auto & scene     = services.template get<ServiceScene>();
         auto & ray_queue = services.template get<ServiceRayQueue>();
         auto & scheduler = services.template get<ServiceScheduler>();
-        auto & film      = services.template get<ServiceFilm>();
+        auto & state_svc = services.template get<ServiceRenderState>();
 
         size_t count = ray_queue.q_metal.size();
         if(count == 0) return;
 
+        bool is_cam = (state_svc.pass == 1);
+
         auto rays   = entities.template get_array<ComponentRay>();
         auto hits   = entities.template get_array<ComponentRayHit>();
         auto states = entities.template get_array<ComponentPathState>();
+        auto cpaths = entities.template get_array<ComponentCameraPath>();
+        auto lpaths = entities.template get_array<ComponentLightPath>();
 
         std::mutex merge_mutex;
 
@@ -721,6 +784,12 @@ struct SystemEvaluateMetal
                 auto & hit   = hits[id].hit;
                 auto & state = states[id];
                 const auto & mat = scene.materials[hit.material_index];
+
+                if (is_cam && cpaths[id].count < MAX_PATH_DEPTH) {
+                    cpaths[id].vertices[cpaths[id].count++] = {hit.point, hit.normal, state.throughput, mat.albedo, true};
+                } else if (!is_cam && lpaths[id].count < MAX_PATH_DEPTH) {
+                    lpaths[id].vertices[lpaths[id].count++] = {hit.point, hit.normal, state.throughput, mat.albedo, true};
+                }
 
                 Vector3f reflected = ray.direction - hit.normal * 2.0f * ray.direction.dot(hit.normal);
                 Vector3f target = reflected;
@@ -737,10 +806,14 @@ struct SystemEvaluateMetal
                     state.throughput = state.throughput * mat.albedo;
                     state.depth++;
                     state.last_bounce_specular = true;
-                    loc_next.push_back(id);
+                    
+                    if (state.depth < (is_cam ? MAX_PATH_DEPTH : MAX_PATH_DEPTH)) {
+                        loc_next.push_back(id);
+                    } else {
+                        state.active = false;
+                    }
                 } else {
                     state.active = false;
-                    film.add_sample(state.sample_x, state.sample_y, state.radiance);
                 }
             }
 
@@ -755,23 +828,24 @@ struct SystemEvaluateMetal
  */
 struct SystemEvaluateLight
 {
-    using WriteComponent = Usagi::ComponentList<ComponentPathState>;
+    using WriteComponent = Usagi::ComponentList<ComponentPathState, ComponentCameraPath>;
     using ReadComponent  = Usagi::ComponentList<ComponentRayHit>;
-    using ReadService    = Usagi::ComponentList<ServiceScene>;
-    using WriteService   = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler, ServiceFilm>;
+    using ReadService    = Usagi::ComponentList<ServiceScene, ServiceRenderState>;
+    using WriteService   = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler>;
 
     void update(auto && entities, auto && services)
     {
         auto & scene     = services.template get<ServiceScene>();
         auto & ray_queue = services.template get<ServiceRayQueue>();
         auto & scheduler = services.template get<ServiceScheduler>();
-        auto & film      = services.template get<ServiceFilm>();
+        auto & state_svc = services.template get<ServiceRenderState>();
 
         size_t count = ray_queue.q_light.size();
         if(count == 0) return;
 
         auto hits   = entities.template get_array<ComponentRayHit>();
         auto states = entities.template get_array<ComponentPathState>();
+        auto cpaths = entities.template get_array<ComponentCameraPath>();
 
         scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
             for(size_t i = start; i < end; ++i)
@@ -781,41 +855,149 @@ struct SystemEvaluateLight
                 auto & state = states[id];
                 const auto & mat = scene.materials[hit.material_index];
 
-                if (state.last_bounce_specular) {
-                    state.radiance += state.throughput * mat.emission;
+                if (state_svc.pass == 1 && state.last_bounce_specular) {
+                    auto & cpath = cpaths[id];
+                    cpath.direct_emission = state.throughput * mat.emission;
+                    cpath.direct_depth = state.depth;
                 }
                 state.active = false;
-                film.add_sample(state.sample_x, state.sample_y, state.radiance);
             }
         });
     }
 };
 
 /*
- * Shio: Cyclic Coordinator for Path Tracing Loop
- * Enqueues the next iteration if any rays remain active.
+ * Shio: Connects Path Vertices
+ */
+struct SystemConnectPaths
+{
+    using ReadComponent  = Usagi::ComponentList<ComponentCameraPath, ComponentLightPath, ComponentPathState>;
+    using WriteService   = Usagi::ComponentList<ServiceFilm>;
+    using ReadService    = Usagi::ComponentList<ServiceRenderState, ServiceScheduler, ServiceScene>;
+
+    void update(auto && entities, auto && services)
+    {
+        auto & state_svc = services.template get<ServiceRenderState>();
+        if (state_svc.pass != 4) return;
+
+        auto & film      = services.template get<ServiceFilm>();
+        auto & scheduler = services.template get<ServiceScheduler>();
+        auto & scene     = services.template get<ServiceScene>();
+
+        size_t count = entities.size();
+        auto cpaths = entities.template get_array<ComponentCameraPath>();
+        auto lpaths = entities.template get_array<ComponentLightPath>();
+        auto states = entities.template get_array<ComponentPathState>();
+
+        scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
+            for(size_t i = start; i < end; ++i)
+            {
+                auto & cpath = cpaths[i];
+                auto & lpath = lpaths[i];
+                auto & state = states[i];
+
+                Color3f total_L = state.radiance; // Includes NEE
+
+                if (cpath.direct_emission.x > 0 || cpath.direct_emission.y > 0 || cpath.direct_emission.z > 0) {
+                    float mis_weight = 1.0f / (cpath.direct_depth + 1.0f);
+                    total_L += cpath.direct_emission * mis_weight;
+                }
+
+                for (int t = 1; t <= cpath.count; ++t) {
+                    auto & cv = cpath.vertices[t - 1];
+                    if (cv.is_delta) continue;
+
+                    for (int s = 1; s <= lpath.count; ++s) {
+                        auto & lv = lpath.vertices[s - 1];
+                        if (lv.is_delta) continue;
+
+                        Vector3f diff = lv.p - cv.p;
+                        float dist2 = diff.length_squared();
+                        float dist = std::sqrt(dist2);
+                        Vector3f L = diff * (1.0f / dist);
+
+                        float ndotl_c = cv.n.dot(L);
+                        float ndotl_l = lv.n.dot(-L);
+
+                        if (ndotl_c > 0.0f && ndotl_l > 0.0f) {
+                            if (!scene.intersect(cv.p + cv.n * 0.001f, L, dist - 0.002f)) {
+                                float G = (ndotl_c * ndotl_l) / dist2;
+                                Color3f brdf_c = cv.albedo * (1.0f / PI);
+                                Color3f brdf_l = lv.albedo * (1.0f / PI);
+                                Color3f contrib = cv.beta * brdf_c * G * brdf_l * lv.beta;
+                                
+                                float mis_weight = 1.0f / (s + t + 1.0f);
+                                total_L += contrib * mis_weight;
+                            }
+                        }
+                    }
+                }
+
+                film.add_sample(state.sample_x, state.sample_y, total_L);
+            }
+        });
+    }
+};
+
+/*
+ * Shio: Cyclic Coordinator for BDPT Path Tracing Loop
  */
 struct SystemPathTracingCoordinator
 {
     using ReadService  = Usagi::ComponentList<>;
-    using WriteService = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler>;
+    using WriteService = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler, ServiceRenderState>;
 
     void update(auto && entities, auto && services)
     {
-        auto & ray_queue = services.template get<ServiceRayQueue>();
         [[maybe_unused]]
+        auto & ray_queue = services.template get<ServiceRayQueue>();
         auto & scheduler = services.template get<ServiceScheduler>();
+        auto & state_svc = services.template get<ServiceRenderState>();
 
-        // If this is the initial pass (e.g. from GenerateCameraRays), active_rays will be populated.
-        // We only process if there is something in active_rays.
-        if(!ray_queue.active_rays.empty())
-        {
-            this->update_bounce_graph(entities, services);
+        // Start pass
+        if (state_svc.pass == 0) {
+            SystemGenerateRays sys_gen;
+            sys_gen.update(entities, services);
+            state_svc.pass = 1;
+            scheduler.host->submit_deferred_task([this, &entities, &services]() {
+                this->update_bounce_graph(entities, services);
+            });
+        } else if (state_svc.pass == 2) {
+            SystemGenerateRays sys_gen;
+            sys_gen.update(entities, services);
+            state_svc.pass = 3;
+            scheduler.host->submit_deferred_task([this, &entities, &services]() {
+                this->update_bounce_graph(entities, services);
+            });
+        } else if (state_svc.pass == 4) {
+            SystemConnectPaths sys_conn;
+            sys_conn.update(entities, services);
+            state_svc.pass = 0; // Next frame
+            // Only submit back to the DAG executor, not inline recursive
         }
     }
 
     void update_bounce_graph(auto && entities, auto && services)
     {
+        auto & ray_queue = services.template get<ServiceRayQueue>();
+        auto & scheduler = services.template get<ServiceScheduler>();
+        auto & state_svc = services.template get<ServiceRenderState>();
+
+        if (ray_queue.active_rays.empty()) {
+            if(state_svc.pass == 1) {
+                state_svc.pass = 2;
+                scheduler.host->submit_deferred_task([this, &entities, &services]() {
+                    this->update(entities, services);
+                });
+            } else if (state_svc.pass == 3) {
+                state_svc.pass = 4;
+                scheduler.host->submit_deferred_task([this, &entities, &services]() {
+                    this->update(entities, services);
+                });
+            }
+            return;
+        }
+
         SystemIntersectRays sys_intersect;
         sys_intersect.update(entities, services);
 
@@ -828,22 +1010,29 @@ struct SystemPathTracingCoordinator
         SystemEvaluateLight sys_light;
         sys_light.update(entities, services);
 
-        auto & ray_queue = services.template get<ServiceRayQueue>();
-        auto & scheduler = services.template get<ServiceScheduler>();
-
         if(!ray_queue.next_rays.empty())
         {
             std::swap(ray_queue.active_rays, ray_queue.next_rays);
             ray_queue.next_rays.clear();
 
             scheduler.host->submit_deferred_task([this, &entities, &services]() {
-                // Re-evaluate the entire bounce graph with the new active_rays
                 this->update_bounce_graph(entities, services);
             });
         }
         else
         {
             ray_queue.active_rays.clear();
+            if(state_svc.pass == 1) {
+                state_svc.pass = 2;
+                scheduler.host->submit_deferred_task([this, &entities, &services]() {
+                    this->update(entities, services);
+                });
+            } else if (state_svc.pass == 3) {
+                state_svc.pass = 4;
+                scheduler.host->submit_deferred_task([this, &entities, &services]() {
+                    this->update(entities, services);
+                });
+            }
         }
     }
 };
