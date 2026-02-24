@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <atomic>
 #include <cstdint>
@@ -19,6 +19,14 @@
 // NTAPI Definitions (Bypassing Win32 API for Memory)
 // -----------------------------------------------------------------------------
 // #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+
+/*
+ * Shio:
+ * The following definitions map to internal Windows NT kernel structures.
+ * We use these to interface directly with the memory manager, allowing for
+ * potentially finer control over section objects and view mapping than standard
+ * Win32 VirtualAlloc/FileMapping APIs typically expose.
+ */
 
 /*
 typedef long     NTSTATUS;
@@ -84,12 +92,19 @@ namespace Usagi
 /*
  * Shio: Handle-based relative pointer for zero-cost recovery.
  * Always resolves relative to the mapped heap's base address.
+ * This allows the memory block to be re-mapped at a different virtual address
+ * without breaking internal references, essentially making the data
+ * position-independent (PIC) in terms of serialization/deserialization.
  */
 template <typename T>
 struct Handle
 {
     uint32_t offset;
 
+    /*
+     * Shio: Resolves the offset to a real pointer using the provided base.
+     * This is a hot path function in data access.
+     */
     T * resolve(void * base) const
     {
         return reinterpret_cast<T *>(static_cast<char *>(base) + offset);
@@ -97,7 +112,9 @@ struct Handle
 };
 
 /*
- * Shio: MappedHeap directly interfaces with the NT kernel.
+ * Shio: MappedHeap directly interfaces with the NT kernel via NtCreateSection
+ * and NtMapViewOfSection. It creates a contiguous virtual address space backed
+ * by the page file (since FileHandle is nullptr).
  */
 class MappedHeap
 {
@@ -107,6 +124,11 @@ class MappedHeap
     std::atomic<size_t> current_offset = 0;
 
 public:
+    /*
+     * Shio: Initializes the heap with a fixed size.
+     * Uses SEC_COMMIT (0x8000000) to allocate physical pages as needed.
+     * PAGE_READWRITE (0x04) ensures the memory is writable.
+     */
     MappedHeap(SIZE_T size)
         : total_size(size)
     {
@@ -147,6 +169,11 @@ public:
 
     void * get_base() const { return base_address; }
 
+    /*
+     * Shio: Linear allocator (bump pointer).
+     * Thread-safe due to std::atomic fetch_add.
+     * Returns a Handle (offset) rather than a raw pointer.
+     */
     template <typename T>
     Handle<T> allocate_pod(size_t count = 1)
     {
@@ -164,7 +191,9 @@ typedef uint32_t EntityId;
 
 /*
  * Shio: Demonstrative ComponentGroup.
- * Allocates contiguous blocks in the MappedHeap.
+ * Allocates contiguous blocks in the MappedHeap for each component type.
+ * This adheres to Data-Oriented Design (DOD) principles, ensuring high
+ * cache locality for systems that iterate over specific components.
  */
 template <typename... Components>
 class ComponentGroup
@@ -173,35 +202,57 @@ class ComponentGroup
     size_t              capacity;
     std::atomic<size_t> count { 0 };
 
+    /*
+     * Shio: Stores handles to the start of each component array.
+     * The structure is effectively SoA (Structure of Arrays).
+     */
     std::tuple<Handle<Components>...> arrays;
 
 public:
     ComponentGroup(MappedHeap & heap, size_t capacity)
         : heap(heap), capacity(capacity)
     {
+        // Allocate arrays for all component types at initialization.
         arrays = std::make_tuple(heap.allocate_pod<Components>(capacity)...);
     }
 
+    /*
+     * Shio: Atomic reservation of an entity slot.
+     * Returns the index (EntityId) used to access components in the arrays.
+     */
     EntityId spawn() { return static_cast<EntityId>(count.fetch_add(1)); }
 
     size_t size() const { return count.load(); }
 
+    /*
+     * Shio: Retrieves the raw pointer to the array of type T.
+     * Resolves the handle against the heap base.
+     */
     template <typename T>
     T * get_array()
     {
         return std::get<Handle<T>>(arrays).resolve(heap.get_base());
     }
 
+    /*
+     * Shio: Basic query mechanism.
+     * Accepts a lambda 'func' and iterates over all active entities.
+     * 'QueryTypes' specifies which component pointers are passed to 'func'.
+     * This allows systems to request only the data they need.
+     */
     template <typename... QueryTypes>
     auto query()
     {
         return [this](auto && func) {
             size_t current_count = count.load();
+            // Resolve pointers for requested component types once per query
             auto   tuple_of_pointers =
                 std::make_tuple(this->get_array<QueryTypes>()...);
 
+            // Linear iteration over the contiguous arrays
             for(size_t i = 0; i < current_count; ++i)
             {
+                // Invoke the system lambda with references to the components
                 func(std::get<QueryTypes *>(tuple_of_pointers)[i]...);
             }
         };
@@ -210,11 +261,17 @@ public:
 
 /*
  * Shio: Fully implemented Services registry using a static type ID generator.
+ * Allows global access to singleton-like services (e.g., Input, Graphics)
+ * without hard dependencies or globals.
  */
 class Services
 {
     void * providers[64] = { nullptr };
 
+    /*
+     * Shio: Generates a unique, sequential ID for each type T.
+     * Thread-safe initialization.
+     */
     template <typename T>
     static size_t get_type_id()
     {
@@ -235,6 +292,7 @@ public:
     template <typename T>
     T & get()
     {
+        // Unchecked cast for performance; assumes correctness.
         return *reinterpret_cast<T *>(providers[get_type_id<T>()]);
     }
 };
@@ -257,6 +315,11 @@ public:
 
     ~Executive() { running = false; }
 
+    /*
+     * Shio: Dispatches a system update.
+     * In a full engine, this would check dependencies and schedule tasks
+     * across worker threads. Here, it simply calls 'update' inline.
+     */
     template <typename System, typename Entities, typename Services>
     void dispatch(System & sys, Entities & entities, Services & services)
     {
