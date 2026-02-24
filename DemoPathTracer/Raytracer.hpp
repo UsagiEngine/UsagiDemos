@@ -386,12 +386,16 @@ struct ServiceFilm
     std::vector<Pixel> pixels;
     int width = 0;
     int height = 0;
+    float filter_radius = 2.0f; // Mitchell filter radius
+    float B = 1.0f / 3.0f;
+    float C = 1.0f / 3.0f;
 
     void init(int w, int h, float rx = 2.0f, float ry = 2.0f)
     {
         width = w;
         height = h;
         pixels = std::vector<Pixel>(w * h);
+        filter_radius = rx;
     }
 
     void clear_direct() {
@@ -403,26 +407,62 @@ struct ServiceFilm
         }
     }
 
-    void add_sample(float px, float py, const Color3f& L, bool is_direct) {
-        int x = std::clamp((int)px, 0, width - 1);
-        int y = std::clamp((int)py, 0, height - 1);
-        int idx = y * width + x;
+    // Shio: PBRT-style Mitchell-Netravali filter (frequency domain properties)
+    float mitchell_1d(float x) const {
+        x = std::abs(2.0f * x / filter_radius);
+        if (x > 2.0f) return 0.0f;
+        float x2 = x * x;
+        float x3 = x * x * x;
+        if (x < 1.0f) {
+            return (1.0f / 6.0f) * ((12.0f - 9.0f * B - 6.0f * C) * x3 + (-18.0f + 12.0f * B + 6.0f * C) * x2 + (6.0f - 2.0f * B));
+        } else {
+            return (1.0f / 6.0f) * ((-B - 6.0f * C) * x3 + (6.0f * B + 30.0f * C) * x2 + (-12.0f * B - 48.0f * C) * x + (8.0f * B + 24.0f * C));
+        }
+    }
+
+    void add_sample(float px, float py, const Color3f& L_in, bool is_direct) {
+        // Shio: Firefly Clamping (Essential for BDPT to prevent massive variance spikes from blowing out the Mitchell lobes)
+        Color3f L = L_in;
+        float lum = L.x * 0.2126f + L.y * 0.7152f + L.z * 0.0722f;
+        float max_lum = 50.0f; // Clamp extreme BDPT outliers
+        if (lum > max_lum) {
+            float scale = max_lum / lum;
+            L.x *= scale;
+            L.y *= scale;
+            L.z *= scale;
+        }
+
+        // Continuous pixel coordinates
+        int x0 = std::max(0, (int)std::ceil(px - 0.5f - filter_radius));
+        int x1 = std::min(width - 1, (int)std::floor(px - 0.5f + filter_radius));
+        int y0 = std::max(0, (int)std::ceil(py - 0.5f - filter_radius));
+        int y1 = std::min(height - 1, (int)std::floor(py - 0.5f + filter_radius));
 
         auto atomic_add = [](std::atomic<double>& target, double val) {
             double old = target.load(std::memory_order_relaxed);
             while(!target.compare_exchange_weak(old, old + val, std::memory_order_relaxed));
         };
 
-        if (is_direct) {
-            atomic_add(pixels[idx].direct_r, static_cast<double>(L.x));
-            atomic_add(pixels[idx].direct_g, static_cast<double>(L.y));
-            atomic_add(pixels[idx].direct_b, static_cast<double>(L.z));
-            atomic_add(pixels[idx].direct_w, 1.0);
-        } else {
-            atomic_add(pixels[idx].indirect_r, static_cast<double>(L.x));
-            atomic_add(pixels[idx].indirect_g, static_cast<double>(L.y));
-            atomic_add(pixels[idx].indirect_b, static_cast<double>(L.z));
-            atomic_add(pixels[idx].indirect_w, 1.0);
+        for (int y = y0; y <= y1; ++y) {
+            for (int x = x0; x <= x1; ++x) {
+                float dx = px - 0.5f - x;
+                float dy = py - 0.5f - y;
+                float weight = mitchell_1d(dx) * mitchell_1d(dy);
+                if (weight != 0.0f) {
+                    int idx = y * width + x;
+                    if (is_direct) {
+                        atomic_add(pixels[idx].direct_r, static_cast<double>(L.x * weight));
+                        atomic_add(pixels[idx].direct_g, static_cast<double>(L.y * weight));
+                        atomic_add(pixels[idx].direct_b, static_cast<double>(L.z * weight));
+                        atomic_add(pixels[idx].direct_w, static_cast<double>(weight));
+                    } else {
+                        atomic_add(pixels[idx].indirect_r, static_cast<double>(L.x * weight));
+                        atomic_add(pixels[idx].indirect_g, static_cast<double>(L.y * weight));
+                        atomic_add(pixels[idx].indirect_b, static_cast<double>(L.z * weight));
+                        atomic_add(pixels[idx].indirect_w, static_cast<double>(weight));
+                    }
+                }
+            }
         }
     }
 
@@ -1378,58 +1418,26 @@ struct SystemRenderGDICanvas
             for(size_t i = start; i < end; ++i)
             {
                 auto & pixel = pixels[i];
-
-                Color3f c_direct = {0, 0, 0};
-                float w_direct_sum = 0.0f;
-                
-                // 5x5 Gaussian Spatial Blur for Direct Light (cleared every frame, so it needs heavy spatial smoothing)
-                for(int dy = -2; dy <= 2; ++dy) {
-                    for(int dx = -2; dx <= 2; ++dx) {
-                        int nx = std::clamp(pixel.x + dx, 0, canvas.width - 1);
-                        int ny = std::clamp(pixel.y + dy, 0, canvas.height - 1);
-                        int nidx = ny * canvas.width + nx;
-
-                        double d_w = film.pixels[nidx].direct_w.load(std::memory_order_relaxed);
-                        if (d_w > 0.0) {
-                            double inv = 1.0 / d_w;
-                            float spatial_weight = std::exp(-(dx*dx + dy*dy) / 4.0f);
-                            
-                            c_direct.x += static_cast<float>(std::max(0.0, film.pixels[nidx].direct_r.load(std::memory_order_relaxed) * inv)) * spatial_weight;
-                            c_direct.y += static_cast<float>(std::max(0.0, film.pixels[nidx].direct_g.load(std::memory_order_relaxed) * inv)) * spatial_weight;
-                            c_direct.z += static_cast<float>(std::max(0.0, film.pixels[nidx].direct_b.load(std::memory_order_relaxed) * inv)) * spatial_weight;
-                            w_direct_sum += spatial_weight;
-                        }
-                    }
-                }
-                if (w_direct_sum > 0.0f) c_direct = c_direct * (1.0f / w_direct_sum);
-
-                Color3f c_indirect = {0, 0, 0};
-                float w_indirect_sum = 0.0f;
-                
-                // 3x3 Gaussian Spatial Blur for Indirect Light (EMA filtered, but needs a slight edge polish)
-                for(int dy = -1; dy <= 1; ++dy) {
-                    for(int dx = -1; dx <= 1; ++dx) {
-                        int nx = std::clamp(pixel.x + dx, 0, canvas.width - 1);
-                        int ny = std::clamp(pixel.y + dy, 0, canvas.height - 1);
-                        int nidx = ny * canvas.width + nx;
-
-                        double i_w = film.pixels[nidx].indirect_w.load(std::memory_order_relaxed);
-                        if (i_w > 0.0) {
-                            double inv = 1.0 / i_w;
-                            float spatial_weight = std::exp(-(dx*dx + dy*dy) / 2.0f);
-                            
-                            c_indirect.x += static_cast<float>(std::max(0.0, film.pixels[nidx].indirect_r.load(std::memory_order_relaxed) * inv)) * spatial_weight;
-                            c_indirect.y += static_cast<float>(std::max(0.0, film.pixels[nidx].indirect_g.load(std::memory_order_relaxed) * inv)) * spatial_weight;
-                            c_indirect.z += static_cast<float>(std::max(0.0, film.pixels[nidx].indirect_b.load(std::memory_order_relaxed) * inv)) * spatial_weight;
-                            w_indirect_sum += spatial_weight;
-                        }
-                    }
-                }
-                if (w_indirect_sum > 0.0f) c_indirect = c_indirect * (1.0f / w_indirect_sum);
-
-                Color3f color = c_direct + c_indirect;
-
                 int idx = pixel.y * canvas.width + pixel.x;
+
+                double d_w = film.pixels[idx].direct_w.load(std::memory_order_relaxed);
+                double i_w = film.pixels[idx].indirect_w.load(std::memory_order_relaxed);
+
+                Color3f color = {0, 0, 0};
+                
+                // Mitchell-Netravali weights can be negative, so we check magnitude > 1e-4
+                if (std::abs(d_w) > 1e-4) {
+                    double inv = 1.0 / d_w;
+                    color.x += static_cast<float>(std::max(0.0, film.pixels[idx].direct_r.load(std::memory_order_relaxed) * inv));
+                    color.y += static_cast<float>(std::max(0.0, film.pixels[idx].direct_g.load(std::memory_order_relaxed) * inv));
+                    color.z += static_cast<float>(std::max(0.0, film.pixels[idx].direct_b.load(std::memory_order_relaxed) * inv));
+                }
+                if (std::abs(i_w) > 1e-4) {
+                    double inv = 1.0 / i_w;
+                    color.x += static_cast<float>(std::max(0.0, film.pixels[idx].indirect_r.load(std::memory_order_relaxed) * inv));
+                    color.y += static_cast<float>(std::max(0.0, film.pixels[idx].indirect_g.load(std::memory_order_relaxed) * inv));
+                    color.z += static_cast<float>(std::max(0.0, film.pixels[idx].indirect_b.load(std::memory_order_relaxed) * inv));
+                }
 
                 // Simple Gamma Correction (approximate sqrt)
                 // Also add an exposure tonemapping to handle the bright sky
