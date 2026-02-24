@@ -410,28 +410,38 @@ struct ServiceFilm
     }
 
     // Shio: PBRT-style Mitchell-Netravali filter (frequency domain properties)
-    float mitchell_1d(float x) const {
-        x = std::abs(2.0f * x / filter_radius);
-        if (x > 2.0f) return 0.0f;
-        float x2 = x * x;
-        float x3 = x * x * x;
-        if (x < 1.0f) {
-            return (1.0f / 6.0f) * ((12.0f - 9.0f * B - 6.0f * C) * x3 + (-18.0f + 12.0f * B + 6.0f * C) * x2 + (6.0f - 2.0f * B));
-        } else {
-            return (1.0f / 6.0f) * ((-B - 6.0f * C) * x3 + (6.0f * B + 30.0f * C) * x2 + (-12.0f * B - 48.0f * C) * x + (8.0f * B + 24.0f * C));
-        }
+    float evaluate_filter(float x, float y) const {
+        auto mitchell_1d = [this](float v) {
+            v = std::abs(2.0f * v / filter_radius);
+            if (v > 2.0f) return 0.0f;
+            float v2 = v * v;
+            float v3 = v * v * v;
+            if (v < 1.0f) {
+                return (1.0f / 6.0f) * ((12.0f - 9.0f * B - 6.0f * C) * v3 + (-18.0f + 12.0f * B + 6.0f * C) * v2 + (6.0f - 2.0f * B));
+            } else {
+                return (1.0f / 6.0f) * ((-B - 6.0f * C) * v3 + (6.0f * B + 30.0f * C) * v2 + (-12.0f * B - 48.0f * C) * v + (8.0f * B + 24.0f * C));
+            }
+        };
+        return mitchell_1d(x) * mitchell_1d(y);
     }
 
     void add_sample(float px, float py, const Color3f& L_in, bool is_direct) {
-        // Shio: Firefly Clamping (Essential for BDPT to prevent massive variance spikes from blowing out the Mitchell lobes)
+        // Shio: Firefly Clamping & NaN prevention (Essential for BDPT to prevent massive variance spikes)
         Color3f L = L_in;
-        float lum = L.x * 0.2126f + L.y * 0.7152f + L.z * 0.0722f;
-        float max_lum = 50.0f; // Clamp extreme BDPT outliers
-        if (lum > max_lum) {
-            float scale = max_lum / lum;
-            L.x *= scale;
-            L.y *= scale;
-            L.z *= scale;
+        if (std::isnan(L.x) || std::isnan(L.y) || std::isnan(L.z)) return;
+
+        // ONLY clamp indirect light (bounces). 
+        // Direct light handles primary rays (looking directly at the sun: 2000.0f)
+        // If we clamp direct light, the sun turns dark grey or black!
+        if (!is_direct) {
+            float lum = L.x * 0.2126f + L.y * 0.7152f + L.z * 0.0722f;
+            float max_lum = 100.0f; 
+            if (lum > max_lum) {
+                float scale = max_lum / lum;
+                L.x *= scale;
+                L.y *= scale;
+                L.z *= scale;
+            }
         }
 
         // Continuous pixel coordinates
@@ -449,7 +459,7 @@ struct ServiceFilm
             for (int x = x0; x <= x1; ++x) {
                 float dx = px - 0.5f - x;
                 float dy = py - 0.5f - y;
-                float weight = mitchell_1d(dx) * mitchell_1d(dy);
+                float weight = evaluate_filter(dx, dy);
                 if (weight != 0.0f) {
                     int idx = y * width + x;
                     if (is_direct) {
@@ -510,6 +520,13 @@ struct ServiceScene
     Color3f evaluate_sky(const Vector3f& view_dir) const {
         if (view_dir.y <= 0.0f) return {0,0,0};
 
+        Vector3f beta_r = {0.0038f, 0.0135f, 0.0331f}; 
+        Vector3f beta_m = {0.0210f, 0.0210f, 0.0210f};
+        Vector3f beta_sum = { beta_r.x + beta_m.x, beta_r.y + beta_m.y, beta_r.z + beta_m.z };
+
+        float v_y = std::max(0.001f, view_dir.y);
+        float opt_depth_v = 1.0f / v_y;
+
         auto calc_sky_for_light = [&](const Vector3f& l_dir, const Color3f& intensity) -> Color3f {
             if (l_dir.y <= 0.0f) return {0,0,0};
             float cos_theta = view_dir.dot(l_dir);
@@ -518,24 +535,15 @@ struct ServiceScene
             float g = 0.98f;
             float mie_phase = 1.5f * ((1.0f - g*g) / (2.0f + g*g)) * (1.0f + cos_theta*cos_theta) / std::pow(1.0f + g*g - 2.0f*g*cos_theta + 0.001f, 1.5f);
 
-            Vector3f beta_r = {0.0038f, 0.0135f, 0.0331f}; 
-            Vector3f beta_m = {0.0210f, 0.0210f, 0.0210f};
-
-            float v_y = std::max(0.001f, view_dir.y);
             float s_y = std::max(0.001f, l_dir.y);
-
-            float opt_depth_v = 1.0f / v_y;
             float opt_depth_s = 1.0f / s_y;
-
-            // Total scattering coefficient sum
-            Vector3f beta_sum = { beta_r.x + beta_m.x, beta_r.y + beta_m.y, beta_r.z + beta_m.z };
 
             Vector3f tau = {
                 beta_sum.x * (opt_depth_v + opt_depth_s) * 5.0f,
                 beta_sum.y * (opt_depth_v + opt_depth_s) * 5.0f,
                 beta_sum.z * (opt_depth_v + opt_depth_s) * 5.0f
             };
-            Vector3f attenuation = { std::exp(-tau.x), std::exp(-tau.y), std::exp(-tau.z) };
+            Vector3f scatter_attenuation = { std::exp(-tau.x), std::exp(-tau.y), std::exp(-tau.z) };
 
             Vector3f scatter = {
                 (beta_r.x * rayleigh_phase + beta_m.x * mie_phase),
@@ -545,9 +553,9 @@ struct ServiceScene
             
             // Proper physically-based in-scattering equation
             Vector3f sky = {
-                (scatter.x / beta_sum.x) * (1.0f - attenuation.x),
-                (scatter.y / beta_sum.y) * (1.0f - attenuation.y),
-                (scatter.z / beta_sum.z) * (1.0f - attenuation.z)
+                (scatter.x / beta_sum.x) * (1.0f - scatter_attenuation.x),
+                (scatter.y / beta_sum.y) * (1.0f - scatter_attenuation.y),
+                (scatter.z / beta_sum.z) * (1.0f - scatter_attenuation.z)
             };
             
             // The sky itself also receives less light as the light source sets
@@ -564,12 +572,45 @@ struct ServiceScene
         Color3f sun_sky = calc_sky_for_light(sun_dir, {20.0f, 20.0f, 20.0f});
         Color3f moon_sky = calc_sky_for_light(moon_dir, {0.2f, 0.24f, 0.3f}); // Much dimmer moonlight
 
+        // Shio: Sun and Moon disc evaluation for primary background rays.
+        // The raw base emission of the sun is 2000.0, but to see it turn orange
+        // as it sets, it *must* undergo the same transmission attenuation as the scattered sky!
+        float sun_angular_radius = 0.045f;
+        float cos_theta_sun = view_dir.dot(sun_dir);
+        if (cos_theta_sun > std::cos(sun_angular_radius) && sun_dir.y > 0.0f) {
+            float s_y = std::max(0.001f, sun_dir.y);
+            Vector3f s_tau = { beta_sum.x * (1.0f / s_y) * 5.0f, beta_sum.y * (1.0f / s_y) * 5.0f, beta_sum.z * (1.0f / s_y) * 5.0f };
+            Vector3f sun_attenuation = { std::exp(-s_tau.x), std::exp(-s_tau.y), std::exp(-s_tau.z) };
+            
+             sun_sky += Color3f{
+                 2000.0f * sun_attenuation.x, 
+                 1000.0f * sun_attenuation.y, 
+                  500.0f * sun_attenuation.z
+             };
+        }
+
+        float moon_angular_radius = 0.040f;
+        float cos_theta_moon = view_dir.dot(moon_dir);
+        if (cos_theta_moon > std::cos(moon_angular_radius) && moon_dir.y > 0.0f) {
+            
+            // The moon is in a different position than the sun, so it has its own unique atmospheric thickness
+            float opt_depth_m = 1.0f / std::max(0.001f, moon_dir.y);
+            Vector3f m_tau = { beta_sum.x * opt_depth_m * 5.0f, beta_sum.y * opt_depth_m * 5.0f, beta_sum.z * opt_depth_m * 5.0f };
+            Vector3f m_attenuation = { std::exp(-m_tau.x), std::exp(-m_tau.y), std::exp(-m_tau.z) };
+
+            moon_sky += Color3f{
+                15.0f * m_attenuation.x, 
+                18.0f * m_attenuation.y, 
+                22.0f * m_attenuation.z
+            };
+        }
+
         Color3f total_sky = sun_sky + moon_sky;
 
-        // Add a small ambient floor so night isn't pure #000000
-        total_sky.x += 0.01f;
-        total_sky.y += 0.02f;
-        total_sky.z += 0.05f;
+        // Add a tiny ambient floor to prevent division-by-zero or pure black
+        total_sky.x += 0.001f;
+        total_sky.y += 0.002f;
+        total_sky.z += 0.005f;
 
         return total_sky;
     }
@@ -626,7 +667,22 @@ struct ServiceScene
                 if (current_idx++ == light_idx) {
                     s.sample_surface(rng, p, n, pdf);
                     pdf /= light_count; // Scale pdf by uniform choice probability
-                    emission = evaluate_emission(materials[s.material_index], p, s.center);
+                    
+                    Color3f base_emission = evaluate_emission(materials[s.material_index], p, s.center);
+                    
+                    // Atmosphere attenuation for BDPT light path origins
+                    // Shio: p is the position on the sun/moon. The direction FROM the origin TO the light is simply p.normalize()
+                    Vector3f dir_to_light = p.normalize();
+                    float l_y = std::max(0.001f, dir_to_light.y);
+                    float opt_depth_l = 1.0f / l_y;
+                    Vector3f tau = {
+                        (0.0038f + 0.0210f) * opt_depth_l * 5.0f,
+                        (0.0135f + 0.0210f) * opt_depth_l * 5.0f,
+                        (0.0331f + 0.0210f) * opt_depth_l * 5.0f
+                    };
+                    Vector3f attenuation = { std::exp(-tau.x), std::exp(-tau.y), std::exp(-tau.z) };
+
+                    emission = { base_emission.x * attenuation.x, base_emission.y * attenuation.y, base_emission.z * attenuation.z };
                     return true;
                 }
             }
@@ -1195,9 +1251,22 @@ struct SystemEvaluateLight
                 if (state_svc.pass == 1) { // Removed last_bounce_specular check to cover diffuse direct hits
                     auto & cpath = cpaths[id];
                     
-                    Color3f emission = scene.evaluate_emission(mat, hit.point, hit.obj_center);
+                    Color3f raw_emission = scene.evaluate_emission(mat, hit.point, hit.obj_center);
 
-                    if (cpath.count == 0) {
+                    // Compute atmospheric attenuation from the viewer to the celestial body
+                    // Shio: hit.point is on the sun. Direction TO the light is hit.point.normalize()
+                    Vector3f dir_to_light = hit.point.normalize();
+                    float l_y = std::max(0.001f, dir_to_light.y);
+                    float opt_depth_l = 1.0f / l_y;
+                    Vector3f tau = {
+                        (0.0038f + 0.0210f) * opt_depth_l * 5.0f,
+                        (0.0135f + 0.0210f) * opt_depth_l * 5.0f,
+                        (0.0331f + 0.0210f) * opt_depth_l * 5.0f
+                    };
+                    Vector3f attenuation = { std::exp(-tau.x), std::exp(-tau.y), std::exp(-tau.z) };
+                    Color3f emission = { raw_emission.x * attenuation.x, raw_emission.y * attenuation.y, raw_emission.z * attenuation.z };
+
+                    if (state.depth == 0) {
                         // Pure direct hits bypass MIS and go straight to the direct buffer!
                         film.add_sample(state.sample_x, state.sample_y, state.radiance + state.throughput * emission, true);
                     } else {
@@ -1342,41 +1411,25 @@ struct SystemPathTracingCoordinator
                 // Sphere 0 is the Sun
                 scene.spheres[0].center = scene.sun_dir * 1000.0f;
                 
-                float s_y = std::max(0.001f, scene.sun_dir.y);
-                float opt_depth_s = 1.0f / s_y;
-                Vector3f tau = {
-                    0.0038f * opt_depth_s * 5.0f, 
-                    0.0135f * opt_depth_s * 5.0f, 
-                    0.0331f * opt_depth_s * 5.0f
-                };
-                Vector3f attenuation = { std::exp(-tau.x), std::exp(-tau.y), std::exp(-tau.z) };
-                if (scene.sun_dir.y <= 0.0f) attenuation = {0.0f, 0.0f, 0.0f};
-
-                scene.materials[scene.spheres[0].material_index].emission = {
-                    attenuation.x * 2000.0f,
-                    attenuation.y * 1000.0f,
-                    attenuation.z *  500.0f
-                };
+                // Set the base sun emission extremely bright and raw. 
+                // The physical scattering equations in evaluate_sky and evaluate_light will naturally
+                // scatter blue light away, turning the *remaining* transmitted beam orange without
+                // artificially hacking the source color.
+                if (scene.sun_dir.y > 0.0f) {
+                    scene.materials[scene.spheres[0].material_index].emission = { 2000.0f, 1000.0f, 500.0f };
+                } else {
+                    scene.materials[scene.spheres[0].material_index].emission = { 0.0f, 0.0f, 0.0f };
+                }
 
                 // Sphere 1 is the Moon
                 scene.spheres[1].center = scene.moon_dir * 1000.0f;
                 
-                float m_y = std::max(0.001f, scene.moon_dir.y);
-                float opt_depth_m = 1.0f / m_y;
-                Vector3f m_tau = {
-                    0.0038f * opt_depth_m * 5.0f, 
-                    0.0135f * opt_depth_m * 5.0f, 
-                    0.0331f * opt_depth_m * 5.0f
-                };
-                Vector3f m_attenuation = { std::exp(-m_tau.x), std::exp(-m_tau.y), std::exp(-m_tau.z) };
-                if (scene.moon_dir.y <= 0.0f) m_attenuation = {0.0f, 0.0f, 0.0f};
-
-                // Base moon color (pale blue/white) properly attenuated by atmosphere
-                scene.materials[scene.spheres[1].material_index].emission = {
-                    m_attenuation.x * 15.0f,
-                    m_attenuation.y * 18.0f,
-                    m_attenuation.z * 22.0f
-                };
+                // Base moon color (pale blue/white). Moon is very dim compared to the sun.
+                if (scene.moon_dir.y > 0.0f) {
+                    scene.materials[scene.spheres[1].material_index].emission = { 15.0f, 18.0f, 22.0f };
+                } else {
+                    scene.materials[scene.spheres[1].material_index].emission = { 0.0f, 0.0f, 0.0f };
+                }
             }
 
             SystemGenerateRays sys_gen;
@@ -1478,6 +1531,8 @@ struct SystemRenderGDICanvas
         size_t count = entities.size();
         auto pixels  = entities.template get_array<ComponentPixel>();
 
+        // Shio: Fast 3x3 Edge-Avoiding Bilateral filter pass using luminance differentials
+        // to smooth noise without destroying structural detail.
         scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
             for(size_t i = start; i < end; ++i)
             {
@@ -1487,28 +1542,91 @@ struct SystemRenderGDICanvas
                 double d_w = film.pixels[idx].direct_w.load(std::memory_order_relaxed);
                 double i_w = film.pixels[idx].indirect_w.load(std::memory_order_relaxed);
 
-                Color3f color = {0, 0, 0};
-                
-                // Mitchell-Netravali weights can be negative, so we check magnitude > 1e-4
-                if (std::abs(d_w) > 1e-4) {
+                Color3f color_center = {0, 0, 0};
+                if (d_w > 0.0) {
                     double inv = 1.0 / d_w;
-                    color.x += static_cast<float>(std::max(0.0, film.pixels[idx].direct_r.load(std::memory_order_relaxed) * inv));
-                    color.y += static_cast<float>(std::max(0.0, film.pixels[idx].direct_g.load(std::memory_order_relaxed) * inv));
-                    color.z += static_cast<float>(std::max(0.0, film.pixels[idx].direct_b.load(std::memory_order_relaxed) * inv));
+                    color_center.x += static_cast<float>(film.pixels[idx].direct_r.load(std::memory_order_relaxed) * inv);
+                    color_center.y += static_cast<float>(film.pixels[idx].direct_g.load(std::memory_order_relaxed) * inv);
+                    color_center.z += static_cast<float>(film.pixels[idx].direct_b.load(std::memory_order_relaxed) * inv);
                 }
-                if (std::abs(i_w) > 1e-4) {
+                if (i_w > 0.0) {
                     double inv = 1.0 / i_w;
-                    color.x += static_cast<float>(std::max(0.0, film.pixels[idx].indirect_r.load(std::memory_order_relaxed) * inv));
-                    color.y += static_cast<float>(std::max(0.0, film.pixels[idx].indirect_g.load(std::memory_order_relaxed) * inv));
-                    color.z += static_cast<float>(std::max(0.0, film.pixels[idx].indirect_b.load(std::memory_order_relaxed) * inv));
+                    color_center.x += static_cast<float>(film.pixels[idx].indirect_r.load(std::memory_order_relaxed) * inv);
+                    color_center.y += static_cast<float>(film.pixels[idx].indirect_g.load(std::memory_order_relaxed) * inv);
+                    color_center.z += static_cast<float>(film.pixels[idx].indirect_b.load(std::memory_order_relaxed) * inv);
                 }
+
+                float lum_center = color_center.x * 0.2126f + color_center.y * 0.7152f + color_center.z * 0.0722f;
+
+                Color3f c_blur = {0, 0, 0};
+                float w_blur_sum = 0.0f;
+                
+                for(int dy = -1; dy <= 1; ++dy) {
+                    for(int dx = -1; dx <= 1; ++dx) {
+                        int nx = std::clamp(pixel.x + dx, 0, canvas.width - 1);
+                        int ny = std::clamp(pixel.y + dy, 0, canvas.height - 1);
+                        int nidx = ny * canvas.width + nx;
+
+                        Color3f neighbor = {0, 0, 0};
+                        
+                        double n_d_w = film.pixels[nidx].direct_w.load(std::memory_order_relaxed);
+                        if (n_d_w > 0.0) {
+                            double inv = 1.0 / n_d_w;
+                            neighbor.x += static_cast<float>(film.pixels[nidx].direct_r.load(std::memory_order_relaxed) * inv);
+                            neighbor.y += static_cast<float>(film.pixels[nidx].direct_g.load(std::memory_order_relaxed) * inv);
+                            neighbor.z += static_cast<float>(film.pixels[nidx].direct_b.load(std::memory_order_relaxed) * inv);
+                        }
+                        double n_i_w = film.pixels[nidx].indirect_w.load(std::memory_order_relaxed);
+                        if (n_i_w > 0.0) {
+                            double inv = 1.0 / n_i_w;
+                            neighbor.x += static_cast<float>(film.pixels[nidx].indirect_r.load(std::memory_order_relaxed) * inv);
+                            neighbor.y += static_cast<float>(film.pixels[nidx].indirect_g.load(std::memory_order_relaxed) * inv);
+                            neighbor.z += static_cast<float>(film.pixels[nidx].indirect_b.load(std::memory_order_relaxed) * inv);
+                        }
+
+                        float lum_neighbor = neighbor.x * 0.2126f + neighbor.y * 0.7152f + neighbor.z * 0.0722f;
+                        
+                        // Edge-stopping function based on luminance difference
+                        float l_diff = lum_neighbor - lum_center;
+                        float w_l = std::exp(-(l_diff * l_diff) / 0.1f); // Range sensitivity tuning
+                        
+                        float w_s = std::exp(-(dx*dx + dy*dy) / 2.0f);
+                        float w = w_s * w_l;
+
+                        c_blur += neighbor * w;
+                        w_blur_sum += w;
+                    }
+                }
+                
+                Color3f color = w_blur_sum > 0.0f ? c_blur * (1.0f / w_blur_sum) : color_center;
+
+                // Protect against negative colors
+                color.x = std::max(0.0f, color.x);
+                color.y = std::max(0.0f, color.y);
+                color.z = std::max(0.0f, color.z);
+
+                // Shio: Robust ACES Filmic Tone Mapping Curve
+                // This gracefully handles extremely bright 2000.0+ HDR pixels (Sun Core) 
+                auto ACESFilm = [](float x) {
+                    float a = 2.51f;
+                    float b = 0.03f;
+                    float c = 2.43f;
+                    float d = 0.59f;
+                    float e = 0.14f;
+                    return std::clamp((x*(a*x+b))/(x*(c*x+d)+e), 0.0f, 1.0f);
+                };
+
+                // Exposure adjustment. Lower exposure maps the intense sun/sky into SDR range without blowout
+                float exposure = 0.1f;
+                color.x *= exposure;
+                color.y *= exposure;
+                color.z *= exposure;
+
+                color.x = ACESFilm(color.x);
+                color.y = ACESFilm(color.y);
+                color.z = ACESFilm(color.z);
 
                 // Simple Gamma Correction (approximate sqrt)
-                // Also add an exposure tonemapping to handle the bright sky
-                color.x = 1.0f - std::exp(-color.x * 0.1f);
-                color.y = 1.0f - std::exp(-color.y * 0.1f);
-                color.z = 1.0f - std::exp(-color.z * 0.1f);
-
                 float r_f = std::sqrt(color.x);
                 float g_f = std::sqrt(color.y);
                 float b_f = std::sqrt(color.z);
