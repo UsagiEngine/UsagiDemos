@@ -373,8 +373,8 @@ struct ServiceGDICanvasProvider
 };
 
 /*
- * Shio: Thread-safe framebuffer allowing sub-pixel filtered samples
- * to be splatted concurrently.
+ * Shio: Thread-safe framebuffer supporting Temporal Anti-Aliasing (TAA)
+ * with Variance/Neighborhood Clamping to eliminate ghosting and noise.
  */
 struct ServiceFilm
 {
@@ -386,21 +386,12 @@ struct ServiceFilm
     std::vector<Pixel> pixels;
     int width = 0;
     int height = 0;
-    float filter_radius_x = 2.0f;
-    float filter_radius_y = 2.0f;
-    float alpha = 2.0f;
-    float expX = 1.0f;
-    float expY = 1.0f;
 
     void init(int w, int h, float rx = 2.0f, float ry = 2.0f)
     {
         width = w;
         height = h;
         pixels = std::vector<Pixel>(w * h);
-        filter_radius_x = rx;
-        filter_radius_y = ry;
-        expX = std::exp(-alpha * rx * rx);
-        expY = std::exp(-alpha * ry * ry);
     }
 
     void clear_direct() {
@@ -412,53 +403,29 @@ struct ServiceFilm
         }
     }
 
-    float gaussian(float d, float expv) const {
-        return std::max(0.0f, std::exp(-alpha * d * d) - expv);
-    }
-
-    float evaluate_filter(float dx, float dy) const {
-        return gaussian(dx, expX) * gaussian(dy, expY);
-    }
-
     void add_sample(float px, float py, const Color3f& L, bool is_direct) {
-        int x0 = std::max(0, (int)std::ceil(px - 0.5f - filter_radius_x));
-        int x1 = std::min(width - 1, (int)std::floor(px - 0.5f + filter_radius_x));
-        int y0 = std::max(0, (int)std::ceil(py - 0.5f - filter_radius_y));
-        int y1 = std::min(height - 1, (int)std::floor(py - 0.5f + filter_radius_y));
+        int x = std::clamp((int)px, 0, width - 1);
+        int y = std::clamp((int)py, 0, height - 1);
+        int idx = y * width + x;
 
         auto atomic_add = [](std::atomic<double>& target, double val) {
             double old = target.load(std::memory_order_relaxed);
             while(!target.compare_exchange_weak(old, old + val, std::memory_order_relaxed));
         };
 
-        for (int y = y0; y <= y1; ++y) {
-            for (int x = x0; x <= x1; ++x) {
-                float dx = px - 0.5f - x;
-                float dy = py - 0.5f - y;
-                float weight = evaluate_filter(dx, dy);
-                if (weight > 0) {
-                    int idx = y * width + x;
-                    if (is_direct) {
-                        atomic_add(pixels[idx].direct_r, static_cast<double>(L.x * weight));
-                        atomic_add(pixels[idx].direct_g, static_cast<double>(L.y * weight));
-                        atomic_add(pixels[idx].direct_b, static_cast<double>(L.z * weight));
-                        atomic_add(pixels[idx].direct_w, static_cast<double>(weight));
-                    } else {
-                        atomic_add(pixels[idx].indirect_r, static_cast<double>(L.x * weight));
-                        atomic_add(pixels[idx].indirect_g, static_cast<double>(L.y * weight));
-                        atomic_add(pixels[idx].indirect_b, static_cast<double>(L.z * weight));
-                        atomic_add(pixels[idx].indirect_w, static_cast<double>(weight));
-                    }
-                }
-            }
+        if (is_direct) {
+            atomic_add(pixels[idx].direct_r, static_cast<double>(L.x));
+            atomic_add(pixels[idx].direct_g, static_cast<double>(L.y));
+            atomic_add(pixels[idx].direct_b, static_cast<double>(L.z));
+            atomic_add(pixels[idx].direct_w, 1.0);
+        } else {
+            atomic_add(pixels[idx].indirect_r, static_cast<double>(L.x));
+            atomic_add(pixels[idx].indirect_g, static_cast<double>(L.y));
+            atomic_add(pixels[idx].indirect_b, static_cast<double>(L.z));
+            atomic_add(pixels[idx].indirect_w, 1.0);
         }
     }
 
-    /*
-     * Shio: Exponentially decays the film's accumulated state.
-     * Essential for dynamic real-time path tracing, so moving objects/lights
-     * don't permanently smear across the image buffer over time.
-     */
     void apply_ema_decay(double decay_factor) {
         for(auto& p : pixels) {
             auto atomic_scale = [](std::atomic<double>& target, double factor) {
@@ -466,7 +433,6 @@ struct ServiceFilm
                 while(!target.compare_exchange_weak(old, old * factor, std::memory_order_relaxed));
             };
             
-            // Only decay indirect paths; direct paths are wiped every frame explicitly
             atomic_scale(p.indirect_r, decay_factor);
             atomic_scale(p.indirect_g, decay_factor);
             atomic_scale(p.indirect_b, decay_factor);
@@ -838,10 +804,10 @@ struct SystemIntersectRays
                     if(state_svc.pass == 1) { // Camera paths
                         Color3f sky = scene.evaluate_sky(ray.direction);
                         
-                        // We must add the direct sky emission explicitly to the direct buffer, 
-                        // as it will not go through SystemEvaluateLight or SystemConnectPaths
                         Color3f total_sky_L = state.radiance + state.throughput * sky;
-                        film.add_sample(state.sample_x, state.sample_y, total_sky_L, true);
+                        // If this is the primary camera ray, it's direct (cleared every frame). 
+                        // If it bounced, it's indirect (EMA decayed).
+                        film.add_sample(state.sample_x, state.sample_y, total_sky_L, state.depth == 0);
                     }
                 }
             }
@@ -1199,6 +1165,11 @@ struct SystemConnectPaths
                 Color3f indirect_L = {0,0,0};
                 Color3f direct_L = {0,0,0};
 
+                // Explicit direct hit (bounced via material evaluations hitting light source directly).
+                if (cpath.count > 0 && (cpath.direct_emission.x > 0.0f || cpath.direct_emission.y > 0.0f || cpath.direct_emission.z > 0.0f)) {
+                     indirect_L += cpath.direct_emission;
+                }
+
                 for (int t = 1; t <= cpath.count; ++t) {
                     auto & cv = cpath.vertices[t - 1];
                     if (cv.is_delta) continue;
@@ -1229,11 +1200,9 @@ struct SystemConnectPaths
                                 
                                 float mis_weight = compute_mis_weight(path, s + t, s, light_area);
                                 
-                                // Direct shadows occur when t=1 (camera connects straight to light subpath).
-                                // But BDPT generates robust paths where t>1 adds to global illumination.
-                                // We classify purely looking at the light (s=0, evaluated above) or first-bounce (t=1, s=1) as direct.
-                                if (t == 1 && s == 1) direct_L += contrib * mis_weight;
-                                else indirect_L += contrib * mis_weight;
+                                // All connection paths are treated as indirect (EMA decayed) since they 
+                                // represent scattered light. Only 0-bounce direct eye hits go to direct_L.
+                                indirect_L += contrib * mis_weight;
                             }
                         }
                     }
@@ -1410,23 +1379,57 @@ struct SystemRenderGDICanvas
             {
                 auto & pixel = pixels[i];
 
-                int idx = pixel.y * canvas.width + pixel.x;
-                double d_w = film.pixels[idx].direct_w.load(std::memory_order_relaxed);
-                double i_w = film.pixels[idx].indirect_w.load(std::memory_order_relaxed);
+                Color3f c_direct = {0, 0, 0};
+                float w_direct_sum = 0.0f;
+                
+                // 5x5 Gaussian Spatial Blur for Direct Light (cleared every frame, so it needs heavy spatial smoothing)
+                for(int dy = -2; dy <= 2; ++dy) {
+                    for(int dx = -2; dx <= 2; ++dx) {
+                        int nx = std::clamp(pixel.x + dx, 0, canvas.width - 1);
+                        int ny = std::clamp(pixel.y + dy, 0, canvas.height - 1);
+                        int nidx = ny * canvas.width + nx;
 
-                Color3f color = {0, 0, 0};
-                if (d_w > 0.0) {
-                    double inv = 1.0 / d_w;
-                    color.x += static_cast<float>(film.pixels[idx].direct_r.load(std::memory_order_relaxed) * inv);
-                    color.y += static_cast<float>(film.pixels[idx].direct_g.load(std::memory_order_relaxed) * inv);
-                    color.z += static_cast<float>(film.pixels[idx].direct_b.load(std::memory_order_relaxed) * inv);
+                        double d_w = film.pixels[nidx].direct_w.load(std::memory_order_relaxed);
+                        if (d_w > 0.0) {
+                            double inv = 1.0 / d_w;
+                            float spatial_weight = std::exp(-(dx*dx + dy*dy) / 4.0f);
+                            
+                            c_direct.x += static_cast<float>(std::max(0.0, film.pixels[nidx].direct_r.load(std::memory_order_relaxed) * inv)) * spatial_weight;
+                            c_direct.y += static_cast<float>(std::max(0.0, film.pixels[nidx].direct_g.load(std::memory_order_relaxed) * inv)) * spatial_weight;
+                            c_direct.z += static_cast<float>(std::max(0.0, film.pixels[nidx].direct_b.load(std::memory_order_relaxed) * inv)) * spatial_weight;
+                            w_direct_sum += spatial_weight;
+                        }
+                    }
                 }
-                if (i_w > 0.0) {
-                    double inv = 1.0 / i_w;
-                    color.x += static_cast<float>(film.pixels[idx].indirect_r.load(std::memory_order_relaxed) * inv);
-                    color.y += static_cast<float>(film.pixels[idx].indirect_g.load(std::memory_order_relaxed) * inv);
-                    color.z += static_cast<float>(film.pixels[idx].indirect_b.load(std::memory_order_relaxed) * inv);
+                if (w_direct_sum > 0.0f) c_direct = c_direct * (1.0f / w_direct_sum);
+
+                Color3f c_indirect = {0, 0, 0};
+                float w_indirect_sum = 0.0f;
+                
+                // 3x3 Gaussian Spatial Blur for Indirect Light (EMA filtered, but needs a slight edge polish)
+                for(int dy = -1; dy <= 1; ++dy) {
+                    for(int dx = -1; dx <= 1; ++dx) {
+                        int nx = std::clamp(pixel.x + dx, 0, canvas.width - 1);
+                        int ny = std::clamp(pixel.y + dy, 0, canvas.height - 1);
+                        int nidx = ny * canvas.width + nx;
+
+                        double i_w = film.pixels[nidx].indirect_w.load(std::memory_order_relaxed);
+                        if (i_w > 0.0) {
+                            double inv = 1.0 / i_w;
+                            float spatial_weight = std::exp(-(dx*dx + dy*dy) / 2.0f);
+                            
+                            c_indirect.x += static_cast<float>(std::max(0.0, film.pixels[nidx].indirect_r.load(std::memory_order_relaxed) * inv)) * spatial_weight;
+                            c_indirect.y += static_cast<float>(std::max(0.0, film.pixels[nidx].indirect_g.load(std::memory_order_relaxed) * inv)) * spatial_weight;
+                            c_indirect.z += static_cast<float>(std::max(0.0, film.pixels[nidx].indirect_b.load(std::memory_order_relaxed) * inv)) * spatial_weight;
+                            w_indirect_sum += spatial_weight;
+                        }
+                    }
                 }
+                if (w_indirect_sum > 0.0f) c_indirect = c_indirect * (1.0f / w_indirect_sum);
+
+                Color3f color = c_direct + c_indirect;
+
+                int idx = pixel.y * canvas.width + pixel.x;
 
                 // Simple Gamma Correction (approximate sqrt)
                 // Also add an exposure tonemapping to handle the bright sky
