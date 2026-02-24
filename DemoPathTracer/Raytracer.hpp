@@ -236,6 +236,34 @@ struct Box
         if(std::abs(p.z - max.z) < epsilon) return { 0, 0, 1 };
         return { 0, 1, 0 };
     }
+
+    void sample_surface(SamplerPCG32& rng, Vector3f& p, Normal3f& n, float& pdf) const
+    {
+        Vector3f d = max - min;
+        float ax = d.y * d.z;
+        float ay = d.x * d.z;
+        float az = d.x * d.y;
+        float total_area = 2.0f * (ax + ay + az);
+        pdf = 1.0f / total_area;
+
+        float r = rng.next_float() * (ax + ay + az);
+        if (r < ax) {
+            p.x = rng.next_float() > 0.5f ? min.x : max.x;
+            p.y = min.y + rng.next_float() * d.y;
+            p.z = min.z + rng.next_float() * d.z;
+            n = {p.x == min.x ? -1.0f : 1.0f, 0.0f, 0.0f};
+        } else if (r < ax + ay) {
+            p.y = rng.next_float() > 0.5f ? min.y : max.y;
+            p.x = min.x + rng.next_float() * d.x;
+            p.z = min.z + rng.next_float() * d.z;
+            n = {0.0f, p.y == min.y ? -1.0f : 1.0f, 0.0f};
+        } else {
+            p.z = rng.next_float() > 0.5f ? min.z : max.z;
+            p.x = min.x + rng.next_float() * d.x;
+            p.y = min.y + rng.next_float() * d.y;
+            n = {0.0f, 0.0f, p.z == min.z ? -1.0f : 1.0f};
+        }
+    }
 };
 
 // -----------------------------------------------------------------------------
@@ -271,6 +299,7 @@ struct ComponentPathState
     SamplerPCG32 rng;
     int          depth;
     bool         active;
+    bool         last_bounce_specular;
     float        sample_x;
     float        sample_y;
 };
@@ -412,6 +441,17 @@ struct ServiceScene
         if(hit_anything) return rec;
         return std::nullopt;
     }
+
+    bool sample_light(SamplerPCG32& rng, Vector3f& p, Normal3f& n, Color3f& emission, float& pdf) const {
+        for (const auto& b : boxes) {
+            if (materials[b.material_index].type == MaterialType::Light) {
+                b.sample_surface(rng, p, n, pdf);
+                emission = materials[b.material_index].emission;
+                return true;
+            }
+        }
+        return false;
+    }
 };
 
 // -----------------------------------------------------------------------------
@@ -483,6 +523,7 @@ struct SystemGenerateCameraRays
                 state.radiance   = { 0.0f, 0.0f, 0.0f };
                 state.depth      = 0;
                 state.active     = true;
+                state.last_bounce_specular = true;
             }
         });
     }
@@ -607,7 +648,22 @@ struct SystemEvaluateLambert
                 auto & state = states[id];
                 const auto & mat = scene.materials[hit.material_index];
 
-                state.radiance += state.throughput * mat.emission;
+                // NEE: Direct Light Sampling (Bidirectional t=1 connection)
+                Vector3f light_p; Normal3f light_n; Color3f light_e; float light_pdf;
+                if (scene.sample_light(state.rng, light_p, light_n, light_e, light_pdf)) {
+                    Vector3f L = light_p - hit.point;
+                    float dist = L.length();
+                    L = L * (1.0f / dist);
+                    float ndotl = hit.normal.dot(L);
+                    float light_ndotl = -light_n.dot(L);
+                    
+                    if (ndotl > 0.0f && light_ndotl > 0.0f) {
+                        if (!scene.intersect(hit.point + hit.normal * 0.001f, L, dist - 0.002f)) {
+                            float solid_angle_pdf = light_pdf * (dist * dist) / light_ndotl;
+                            state.radiance += state.throughput * mat.albedo * light_e * (ndotl / (PI * solid_angle_pdf));
+                        }
+                    }
+                }
 
                 ONB onb;
                 onb.build_from_w(hit.normal);
@@ -619,6 +675,7 @@ struct SystemEvaluateLambert
 
                 state.throughput = state.throughput * mat.albedo;
                 state.depth++;
+                state.last_bounce_specular = false;
                 loc_next.push_back(id);
             }
 
@@ -665,8 +722,6 @@ struct SystemEvaluateMetal
                 auto & state = states[id];
                 const auto & mat = scene.materials[hit.material_index];
 
-                state.radiance += state.throughput * mat.emission;
-
                 Vector3f reflected = ray.direction - hit.normal * 2.0f * ray.direction.dot(hit.normal);
                 Vector3f target = reflected;
                 
@@ -681,6 +736,7 @@ struct SystemEvaluateMetal
 
                     state.throughput = state.throughput * mat.albedo;
                     state.depth++;
+                    state.last_bounce_specular = true;
                     loc_next.push_back(id);
                 } else {
                     state.active = false;
@@ -725,7 +781,9 @@ struct SystemEvaluateLight
                 auto & state = states[id];
                 const auto & mat = scene.materials[hit.material_index];
 
-                state.radiance += state.throughput * mat.emission;
+                if (state.last_bounce_specular) {
+                    state.radiance += state.throughput * mat.emission;
+                }
                 state.active = false;
                 film.add_sample(state.sample_x, state.sample_y, state.radiance);
             }
