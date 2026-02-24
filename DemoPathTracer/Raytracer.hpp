@@ -366,7 +366,7 @@ struct ServiceGDICanvasProvider
 struct ServiceFilm
 {
     struct Pixel {
-        std::atomic<float> r{0}, g{0}, b{0}, weight{0};
+        std::atomic<double> r{0}, g{0}, b{0}, weight{0};
     };
 
     std::vector<Pixel> pixels;
@@ -403,8 +403,8 @@ struct ServiceFilm
         int y0 = std::max(0, (int)std::ceil(py - 0.5f - filter_radius_y));
         int y1 = std::min(height - 1, (int)std::floor(py - 0.5f + filter_radius_y));
 
-        auto atomic_add = [](std::atomic<float>& target, float val) {
-            float old = target.load(std::memory_order_relaxed);
+        auto atomic_add = [](std::atomic<double>& target, double val) {
+            double old = target.load(std::memory_order_relaxed);
             while(!target.compare_exchange_weak(old, old + val, std::memory_order_relaxed));
         };
 
@@ -415,10 +415,12 @@ struct ServiceFilm
                 float weight = evaluate_filter(dx, dy);
                 if (weight > 0) {
                     int idx = y * width + x;
-                    atomic_add(pixels[idx].r, L.x * weight);
-                    atomic_add(pixels[idx].g, L.y * weight);
-                    atomic_add(pixels[idx].b, L.z * weight);
-                    atomic_add(pixels[idx].weight, weight);
+                    atomic_add(pixels[idx].r, static_cast<double>(L.x * weight));
+                    atomic_add(pixels[idx].g, static_cast<double>(L.y * weight));
+                    atomic_add(pixels[idx].b, static_cast<double>(L.z * weight));
+                    // Note: Splat weights accumulate without dividing by frame count here. 
+                    // This allows them to sum up perfectly over millions of rays.
+                    atomic_add(pixels[idx].weight, static_cast<double>(weight));
                 }
             }
         }
@@ -578,6 +580,13 @@ struct SystemGenerateRays
                 if(state.rng.inc == 0)
                 {
                     state.rng.seed(pixel.y * canvas.width + pixel.x + 1, 1337);
+                    
+                    // Advance RNG by the current frame count so we don't repeat the exact 
+                    // same light/camera subpaths every single frame if the PRNG logic was flawed
+                    // or reset elsewhere. PCG32 is robust, but advancing ensures a unique temporal stream.
+                    for (int f = 0; f < canvas.frame_count.load(); ++f) {
+                        state.rng.next_u32();
+                    }
                 }
 
                 state.throughput = { 1.0f, 1.0f, 1.0f };
@@ -1118,14 +1127,17 @@ struct SystemRenderGDICanvas
                 auto & pixel = pixels[i];
 
                 int idx = pixel.y * canvas.width + pixel.x;
-                float weight = film.pixels[idx].weight.load(std::memory_order_relaxed);
+                double weight = film.pixels[idx].weight.load(std::memory_order_relaxed);
 
                 Color3f color = {0, 0, 0};
-                if (weight > 0.0f) {
-                    float inv_w = 1.0f / weight;
-                    color.x = film.pixels[idx].r.load(std::memory_order_relaxed) * inv_w;
-                    color.y = film.pixels[idx].g.load(std::memory_order_relaxed) * inv_w;
-                    color.z = film.pixels[idx].b.load(std::memory_order_relaxed) * inv_w;
+                if (weight > 0.0) {
+                    double inv_w = 1.0 / weight;
+                    // Because each path tracer pass naturally deposits 1 unit of weight *per frame* over the filter radius,
+                    // dividing the total accumulated color by the *total weight splatted* computes the expectation!
+                    // Dividing by frame count AGAIN darkens the image linearly over time towards 0! We ONLY divide by weight.
+                    color.x = static_cast<float>(film.pixels[idx].r.load(std::memory_order_relaxed) * inv_w);
+                    color.y = static_cast<float>(film.pixels[idx].g.load(std::memory_order_relaxed) * inv_w);
+                    color.z = static_cast<float>(film.pixels[idx].b.load(std::memory_order_relaxed) * inv_w);
                 }
 
                 // Simple Gamma Correction (approximate sqrt)
