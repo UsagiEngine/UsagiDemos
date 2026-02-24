@@ -162,6 +162,10 @@ int WINAPI WinMain(
                                   .resolve(primary_heap.get_base());
     services.register_service(&gdi_canvas);
 
+    RT::ServiceFilm film;
+    film.init(WIDTH, HEIGHT, 2.0f, 2.0f);
+    services.register_service(&film);
+
     RT::ServiceScene scene;
     SetupCornellBox(scene);
     services.register_service(&scene);

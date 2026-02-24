@@ -232,11 +232,12 @@ struct ComponentPixel
 struct ComponentPathState
 {
     Color3f    throughput;
-    Color3f    accumulated_radiance;
+    Color3f    radiance;
     XorShift32 rng;
     int        depth;
     bool       active;
-    int        sample_count; // For progressive accumulation
+    float      sample_x;
+    float      sample_y;
 };
 
 // -----------------------------------------------------------------------------
@@ -260,6 +261,72 @@ struct ServiceGDICanvasProvider
     int              width;
     int              height;
     std::atomic<int> frame_count = 0;
+};
+
+/*
+ * Shio: Thread-safe framebuffer allowing sub-pixel filtered samples
+ * to be splatted concurrently.
+ */
+struct ServiceFilm
+{
+    struct Pixel {
+        std::atomic<float> r{0}, g{0}, b{0}, weight{0};
+    };
+
+    std::vector<Pixel> pixels;
+    int width = 0;
+    int height = 0;
+    float filter_radius_x = 2.0f;
+    float filter_radius_y = 2.0f;
+    float alpha = 2.0f;
+    float expX = 1.0f;
+    float expY = 1.0f;
+
+    void init(int w, int h, float rx = 2.0f, float ry = 2.0f)
+    {
+        width = w;
+        height = h;
+        pixels = std::vector<Pixel>(w * h);
+        filter_radius_x = rx;
+        filter_radius_y = ry;
+        expX = std::exp(-alpha * rx * rx);
+        expY = std::exp(-alpha * ry * ry);
+    }
+
+    float gaussian(float d, float expv) const {
+        return std::max(0.0f, std::exp(-alpha * d * d) - expv);
+    }
+
+    float evaluate_filter(float dx, float dy) const {
+        return gaussian(dx, expX) * gaussian(dy, expY);
+    }
+
+    void add_sample(float px, float py, const Color3f& L) {
+        int x0 = std::max(0, (int)std::ceil(px - 0.5f - filter_radius_x));
+        int x1 = std::min(width - 1, (int)std::floor(px - 0.5f + filter_radius_x));
+        int y0 = std::max(0, (int)std::ceil(py - 0.5f - filter_radius_y));
+        int y1 = std::min(height - 1, (int)std::floor(py - 0.5f + filter_radius_y));
+
+        auto atomic_add = [](std::atomic<float>& target, float val) {
+            float old = target.load(std::memory_order_relaxed);
+            while(!target.compare_exchange_weak(old, old + val, std::memory_order_relaxed));
+        };
+
+        for (int y = y0; y <= y1; ++y) {
+            for (int x = x0; x <= x1; ++x) {
+                float dx = px - 0.5f - x;
+                float dy = py - 0.5f - y;
+                float weight = evaluate_filter(dx, dy);
+                if (weight > 0) {
+                    int idx = y * width + x;
+                    atomic_add(pixels[idx].r, L.x * weight);
+                    atomic_add(pixels[idx].g, L.y * weight);
+                    atomic_add(pixels[idx].b, L.z * weight);
+                    atomic_add(pixels[idx].weight, weight);
+                }
+            }
+        }
+    }
 };
 
 /*
@@ -355,8 +422,13 @@ struct SystemGenerateCameraRays
                 }
 
                 // Jitter for anti-aliasing
-                float u = (pixel.x + state.rng.next_float()) / (float)canvas.width;
-                float v = (pixel.y + state.rng.next_float()) / (float)canvas.height;
+                float j_x = state.rng.next_float();
+                float j_y = state.rng.next_float();
+                state.sample_x = pixel.x + j_x;
+                state.sample_y = pixel.y + j_y;
+
+                float u = state.sample_x / (float)canvas.width;
+                float v = state.sample_y / (float)canvas.height;
 
                 // NDC to Camera Space
                 float px = (2.0f * u - 1.0f) * aspect_ratio;
@@ -368,12 +440,9 @@ struct SystemGenerateCameraRays
 
                 // Reset path state for new sample
                 state.throughput = { 1.0f, 1.0f, 1.0f };
-
-                if(canvas.frame_count == 1)
-                    state.accumulated_radiance = { 0, 0, 0 };
-
-                state.depth  = 0;
-                state.active = true;
+                state.radiance   = { 0.0f, 0.0f, 0.0f };
+                state.depth      = 0;
+                state.active     = true;
             }
         });
     }
@@ -383,21 +452,21 @@ struct SystemGenerateCameraRays
  * Shio: The core path tracing logic.
  * Performs one bounce per update call and uses deferred tasks for cyclic
  * execution.
- * Now fully data-parallel across the ray queue.
+ * Now fully data-parallel across the ray queue and performs PBRT-style filtering
+ * on ray termination.
  */
 struct SystemPathBounce
 {
-    using WriteComponent =
-        Usagi::ComponentList<ComponentRay, ComponentPathState>;
-    using ReadService = Usagi::ComponentList<ServiceScene>;
-    using WriteService =
-        Usagi::ComponentList<ServiceRayQueue, ServiceScheduler>;
+    using WriteComponent = Usagi::ComponentList<ComponentRay, ComponentPathState>;
+    using ReadService    = Usagi::ComponentList<ServiceScene>;
+    using WriteService   = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler, ServiceFilm>;
 
     void update(auto && entities, auto && services)
     {
         auto & scene     = services.template get<ServiceScene>();
         auto & ray_queue = services.template get<ServiceRayQueue>();
         auto & scheduler = services.template get<ServiceScheduler>();
+        auto & film      = services.template get<ServiceFilm>();
 
         ray_queue.next_queue.clear();
         size_t count = ray_queue.queue.size();
@@ -427,18 +496,18 @@ struct SystemPathBounce
                     const auto & mat = scene.materials[hit->material_index];
 
                     // Emissive contribution
-                    state.accumulated_radiance += state.throughput * mat.emission;
+                    state.radiance += state.throughput * mat.emission;
 
                     // Scatter
                     if(mat.type == MaterialType::Light || state.depth >= 5)
                     {
                         state.active = false;
+                        film.add_sample(state.sample_x, state.sample_y, state.radiance);
                         continue;
                     }
 
                     // Lambertian Scatter
-                    Vector3f target = hit->point + hit->normal +
-                        random_in_unit_sphere(state.rng).normalize();
+                    Vector3f target = hit->point + hit->normal + random_in_unit_sphere(state.rng).normalize();
 
                     ray.origin    = hit->point;
                     ray.direction = (target - hit->point).normalize();
@@ -453,6 +522,7 @@ struct SystemPathBounce
                 {
                     // Background (Black for Cornell Box)
                     state.active = false;
+                    film.add_sample(state.sample_x, state.sample_y, state.radiance);
                 }
             }
 
@@ -476,28 +546,34 @@ struct SystemPathBounce
 
 struct SystemRenderGDICanvas
 {
-    using ReadComponent  = Usagi::ComponentList<ComponentPixel, ComponentPathState>;
+    using ReadComponent  = Usagi::ComponentList<ComponentPixel>;
     using WriteService   = Usagi::ComponentList<ServiceGDICanvasProvider>;
-    using ReadService    = Usagi::ComponentList<ServiceScheduler>;
+    using ReadService    = Usagi::ComponentList<ServiceScheduler, ServiceFilm>;
 
     void update(auto && entities, auto && services)
     {
         auto & canvas    = services.template get<ServiceGDICanvasProvider>();
         auto & scheduler = services.template get<ServiceScheduler>();
-        float  scale     = 1.0f / (float)std::max(1, canvas.frame_count.load());
+        auto & film      = services.template get<ServiceFilm>();
 
         size_t count = entities.size();
         auto pixels  = entities.template get_array<ComponentPixel>();
-        auto states  = entities.template get_array<ComponentPathState>();
 
         scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
             for(size_t i = start; i < end; ++i)
             {
                 auto & pixel = pixels[i];
-                auto & state = states[i];
 
-                // Average samples
-                Color3f color = state.accumulated_radiance * scale;
+                int idx = pixel.y * canvas.width + pixel.x;
+                float weight = film.pixels[idx].weight.load(std::memory_order_relaxed);
+
+                Color3f color = {0, 0, 0};
+                if (weight > 0.0f) {
+                    float inv_w = 1.0f / weight;
+                    color.x = film.pixels[idx].r.load(std::memory_order_relaxed) * inv_w;
+                    color.y = film.pixels[idx].g.load(std::memory_order_relaxed) * inv_w;
+                    color.z = film.pixels[idx].b.load(std::memory_order_relaxed) * inv_w;
+                }
 
                 // Simple Gamma Correction (approximate sqrt)
                 float r_f = std::sqrt(color.x);
@@ -508,7 +584,7 @@ struct SystemRenderGDICanvas
                 uint8_t g = static_cast<uint8_t>(std::clamp(g_f * 255.0f, 0.0f, 255.0f));
                 uint8_t b = static_cast<uint8_t>(std::clamp(b_f * 255.0f, 0.0f, 255.0f));
 
-                canvas.pixel_buffer[pixel.y * canvas.width + pixel.x] = (r << 16) | (g << 8) | b;
+                canvas.pixel_buffer[idx] = (r << 16) | (g << 8) | b;
             }
         });
     }
