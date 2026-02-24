@@ -89,6 +89,11 @@ NTSTATUS NTAPI NtClose(HANDLE Handle);
 namespace Usagi
 {
 
+template <typename... Ts>
+struct ComponentList
+{
+};
+
 /*
  * Shio: Handle-based relative pointer for zero-cost recovery.
  * Always resolves relative to the mapped heap's base address.

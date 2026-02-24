@@ -40,6 +40,7 @@
     <ClInclude Include="ComponentRayDefinition.hpp" />
     <ClInclude Include="CoordinateSystems\Cartesian\ComponentCartesianPosition.hpp" />
     <ClInclude Include="CoordinateSystems\Cartesian\ComponentOrthonormalBasis.hpp" />
+    <ClInclude Include="Executive.hpp" />
     <ClInclude Include="Intersection\TagAnyIntersection.hpp" />
     <ClInclude Include="Objects\ComponentAxisAlignedBoundingBoxDefinition.hpp" />
     <ClInclude Include="Objects\ComponentBoxDefinition.hpp" />

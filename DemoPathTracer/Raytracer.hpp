@@ -7,6 +7,7 @@
 #include <optional>
 #include <vector>
 
+#include "Executive.hpp"
 #include "UsagiCore.hpp"
 
 namespace RT
@@ -242,6 +243,17 @@ struct ComponentPathState
 // Services
 // -----------------------------------------------------------------------------
 
+struct ServiceScheduler
+{
+    Usagi::TaskGraphExecutionHost * host = nullptr;
+};
+
+struct ServiceRayQueue
+{
+    std::vector<uint32_t> queue;
+    std::vector<uint32_t> next_queue;
+};
+
 struct ServiceGDICanvasProvider
 {
     uint32_t *       pixel_buffer;
@@ -304,10 +316,25 @@ struct ServiceScene
  */
 struct SystemGenerateCameraRays
 {
+    using WriteComponent =
+        Usagi::ComponentList<ComponentRay, ComponentPathState>;
+    using ReadComponent = Usagi::ComponentList<ComponentPixel>;
+    using WriteService =
+        Usagi::ComponentList<ServiceGDICanvasProvider, ServiceRayQueue>;
+
     void update(auto && entities, auto && services)
     {
-        auto & canvas = services.template get<ServiceGDICanvasProvider>();
+        auto & canvas    = services.template get<ServiceGDICanvasProvider>();
+        auto & ray_queue = services.template get<ServiceRayQueue>();
+
         canvas.frame_count++;
+
+        ray_queue.queue.clear();
+        size_t count = entities.size();
+        for(size_t i = 0; i < count; ++i)
+        {
+            ray_queue.queue.push_back(static_cast<uint32_t>(i));
+        }
 
         Vector3f cam_pos = { 0.0f, 5.0f, -18.0f }; // Moved back to see full box
         float    aspect_ratio = static_cast<float>(canvas.width) /
@@ -356,59 +383,88 @@ struct SystemGenerateCameraRays
 
 /*
  * Shio: The core path tracing logic.
- * Performs one bounce per update call.
+ * Performs one bounce per update call and uses deferred tasks for cyclic
+ * execution.
  */
 struct SystemPathBounce
 {
+    using WriteComponent =
+        Usagi::ComponentList<ComponentRay, ComponentPathState>;
+    using ReadService = Usagi::ComponentList<ServiceScene>;
+    using WriteService =
+        Usagi::ComponentList<ServiceRayQueue, ServiceScheduler>;
+
     void update(auto && entities, auto && services)
     {
-        auto & scene = services.template get<ServiceScene>();
+        auto & scene     = services.template get<ServiceScene>();
+        auto & ray_queue = services.template get<ServiceRayQueue>();
+        auto & scheduler = services.template get<ServiceScheduler>();
 
-        entities.template query<ComponentRay, ComponentPathState>()(
-            [&](ComponentRay & ray, ComponentPathState & state) {
-                if(!state.active) return;
+        ray_queue.next_queue.clear();
 
-                auto hit =
-                    scene.intersect(ray.origin, ray.direction, ray.t_max);
+        auto rays   = entities.template get_array<ComponentRay>();
+        auto states = entities.template get_array<ComponentPathState>();
 
-                if(hit)
+        for(uint32_t id : ray_queue.queue)
+        {
+            auto & ray   = rays[id];
+            auto & state = states[id];
+
+            if(!state.active) continue;
+
+            auto hit = scene.intersect(ray.origin, ray.direction, ray.t_max);
+
+            if(hit)
+            {
+                const auto & mat = scene.materials[hit->material_index];
+
+                // Emissive contribution
+                state.accumulated_radiance += state.throughput * mat.emission;
+
+                // Scatter
+                if(mat.type == MaterialType::Light || state.depth >= 5)
                 {
-                    const auto & mat = scene.materials[hit->material_index];
-
-                    // Emissive contribution
-                    state.accumulated_radiance +=
-                        state.throughput * mat.emission;
-
-                    // Scatter
-                    if(mat.type == MaterialType::Light || state.depth >= 5)
-                    {
-                        state.active = false;
-                        return;
-                    }
-
-                    // Lambertian Scatter
-                    // Target = point + normal + random_unit_vector
-                    Vector3f target = hit->point + hit->normal +
-                        random_in_unit_sphere(state.rng).normalize();
-
-                    ray.origin    = hit->point;
-                    ray.direction = (target - hit->point).normalize();
-                    ray.t_max     = 1000.0f;
-
-                    state.throughput = state.throughput * mat.albedo;
-                    state.depth++;
-                }
-                else
-                {
-                    // Background (Black for Cornell Box)
                     state.active = false;
+                    continue;
                 }
-            });
+
+                // Lambertian Scatter
+                Vector3f target = hit->point + hit->normal +
+                    random_in_unit_sphere(state.rng).normalize();
+
+                ray.origin    = hit->point;
+                ray.direction = (target - hit->point).normalize();
+                ray.t_max     = 1000.0f;
+
+                state.throughput = state.throughput * mat.albedo;
+                state.depth++;
+
+                ray_queue.next_queue.push_back(id);
+            }
+            else
+            {
+                // Background (Black for Cornell Box)
+                state.active = false;
+            }
+        }
+
+        if(!ray_queue.next_queue.empty())
+        {
+            std::swap(ray_queue.queue, ray_queue.next_queue);
+            scheduler.host->submit_deferred_task(
+                [this, &entities, &services]() {
+                    this->update(entities, services);
+                });
+        }
     }
 };
 
 struct SystemRenderGDICanvas
 {
+    using ReadComponent =
+        Usagi::ComponentList<ComponentPixel, ComponentPathState>;
+    using WriteService = Usagi::ComponentList<ServiceGDICanvasProvider>;
+
     void update(auto && entities, auto && services)
     {
         auto & canvas = services.template get<ServiceGDICanvasProvider>();

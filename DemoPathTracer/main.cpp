@@ -166,6 +166,12 @@ int WINAPI WinMain(
     SetupCornellBox(scene);
     services.register_service(&scene);
 
+    RT::ServiceRayQueue ray_queue;
+    services.register_service(&ray_queue);
+
+    RT::ServiceScheduler scheduler;
+    services.register_service(&scheduler);
+
     // Init Entities
     for(int y = 0; y < HEIGHT; ++y)
     {
@@ -183,24 +189,22 @@ int WINAPI WinMain(
 
     // Shio: Launch the render thread
     std::thread render_thread([&]() {
-        Usagi::Executive             executive(1);
+        Usagi::TaskGraphExecutionHost host(std::thread::hardware_concurrency());
+        scheduler.host = &host;
+
         RT::SystemGenerateCameraRays sys_gen_rays;
         RT::SystemPathBounce         sys_bounce;
         RT::SystemRenderGDICanvas    sys_render;
 
+        host.register_system(sys_gen_rays, primary_group, services);
+        host.register_system(sys_bounce, primary_group, services);
+        host.register_system(sys_render, primary_group, services);
+
+        host.build_graph();
+
         while(g_RenderActive)
         {
-            // 1. Generate Primary Rays
-            executive.dispatch(sys_gen_rays, primary_group, services);
-
-            // 2. Iterative Bounces
-            for(int i = 0; i < 5; ++i)
-            {
-                executive.dispatch(sys_bounce, primary_group, services);
-            }
-
-            // 3. Render to Buffer
-            executive.dispatch(sys_render, primary_group, services);
+            host.execute();
         }
     });
 
