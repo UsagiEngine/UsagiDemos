@@ -82,6 +82,11 @@ void SetupCornellBox(RT::ServiceScene & scene)
         { 0.8f, 0.85f, 0.88f },
         { 0, 0, 0 },
         0.02f });
+    // 5: Translucent (Glass)
+    scene.materials.push_back({ MaterialType::Translucent,
+        { 1.0f, 1.0f, 1.0f },
+        { 0, 0, 0 },
+        0.0f, 1.5f });
 
     // Cornell Box Walls (approximated with large boxes or planes, using Boxes
     // here)
@@ -106,9 +111,9 @@ void SetupCornellBox(RT::ServiceScene & scene)
     // Short box
     scene.boxes.push_back(
         { { -3.0f, -s, 2.0f }, { 0.0f, -s + 3.0f, 5.0f }, 0 });
-    // Tall box (White)
+    // Tall box (Glass)
     scene.boxes.push_back(
-        { { 2.0f, -s, -3.0f }, { 5.0f, -s + 6.0f, 0.0f }, 0 });
+        { { 2.0f, -s, -3.0f }, { 5.0f, -s + 6.0f, 0.0f }, 5 });
 }
 
 int WINAPI WinMain(
@@ -208,7 +213,7 @@ int WINAPI WinMain(
 
     // Shio: Launch the render thread
     std::thread render_thread([&]() {
-        Usagi::TaskGraphExecutionHost host(std::thread::hardware_concurrency());
+        Usagi::TaskGraphExecutionHost host(std::thread::hardware_concurrency() * 2);
         scheduler.host = &host;
 
         RT::SystemGenerateRays           sys_gen_rays;
@@ -253,7 +258,7 @@ int WINAPI WinMain(
 
         // Yield slightly to prevent 100% CPU usage on the UI thread effectively
         // busy-waiting for messages if the queue is empty.
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     return 0;

@@ -151,6 +151,7 @@ enum class MaterialType
     Lambert,
     Metal,
     Light,
+    Translucent,
 };
 
 struct Material
@@ -158,7 +159,8 @@ struct Material
     MaterialType type;
     Color3f      albedo;
     Color3f      emission;
-    float        roughness; // For Metal
+    float        roughness; // For Metal / Translucent
+    float        ior;       // Index of Refraction for Translucent
 };
 
 struct HitRecord
@@ -288,7 +290,7 @@ struct ComponentPixel
     int x, y;
 };
 
-constexpr int MAX_PATH_DEPTH = 5;
+constexpr int MAX_PATH_DEPTH = 15;
 
 struct PathVertex {
     Vector3f p;
@@ -346,6 +348,7 @@ struct ServiceRayQueue
     
     std::vector<uint32_t> q_lambert;
     std::vector<uint32_t> q_metal;
+    std::vector<uint32_t> q_translucent;
     std::vector<uint32_t> q_light;
     
     std::vector<uint32_t> next_rays;
@@ -665,6 +668,7 @@ struct SystemIntersectRays
         ray_queue.q_lambert.clear();
         ray_queue.q_metal.clear();
         ray_queue.q_light.clear();
+        ray_queue.q_translucent.clear();
 
         size_t count = ray_queue.active_rays.size();
         if(count == 0) return;
@@ -679,6 +683,7 @@ struct SystemIntersectRays
             std::vector<uint32_t> loc_lambert;
             std::vector<uint32_t> loc_metal;
             std::vector<uint32_t> loc_light;
+            std::vector<uint32_t> loc_translucent;
 
             for(size_t i = start; i < end; ++i)
             {
@@ -698,13 +703,15 @@ struct SystemIntersectRays
 
                     const auto & mat = scene.materials[opt_hit->material_index];
                     
-                    if (state.depth >= 5) {
+                    if (state.depth >= MAX_PATH_DEPTH) {
                         state.active = false;
                         loc_light.push_back(id); // Send to light to pick up emission, but it won't bounce
                     } else if (mat.type == MaterialType::Lambert) {
                         loc_lambert.push_back(id);
                     } else if (mat.type == MaterialType::Metal) {
                         loc_metal.push_back(id);
+                    } else if (mat.type == MaterialType::Translucent) {
+                        loc_translucent.push_back(id);
                     } else if (mat.type == MaterialType::Light) {
                         loc_light.push_back(id);
                     }
@@ -722,13 +729,115 @@ struct SystemIntersectRays
             ray_queue.q_lambert.insert(ray_queue.q_lambert.end(), loc_lambert.begin(), loc_lambert.end());
             ray_queue.q_metal.insert(ray_queue.q_metal.end(), loc_metal.begin(), loc_metal.end());
             ray_queue.q_light.insert(ray_queue.q_light.end(), loc_light.begin(), loc_light.end());
+            ray_queue.q_translucent.insert(ray_queue.q_translucent.end(), loc_translucent.begin(), loc_translucent.end());
         });
     }
 };
 
 /*
- * Shio: Evaluates Lambertian materials.
+ * Shio: Evaluates Translucent materials using Schlick's approximation for dielectric reflection/refraction.
  */
+struct SystemEvaluateTranslucent
+{
+    using WriteComponent = Usagi::ComponentList<ComponentRay, ComponentPathState, ComponentCameraPath, ComponentLightPath>;
+    using ReadComponent  = Usagi::ComponentList<ComponentRayHit>;
+    using ReadService    = Usagi::ComponentList<ServiceScene, ServiceRenderState>;
+    using WriteService   = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler>;
+
+    void update(auto && entities, auto && services)
+    {
+        auto & scene     = services.template get<ServiceScene>();
+        auto & ray_queue = services.template get<ServiceRayQueue>();
+        auto & scheduler = services.template get<ServiceScheduler>();
+        auto & state_svc = services.template get<ServiceRenderState>();
+
+        size_t count = ray_queue.q_translucent.size();
+        if(count == 0) return;
+
+        bool is_cam = (state_svc.pass == 1);
+
+        auto rays   = entities.template get_array<ComponentRay>();
+        auto hits   = entities.template get_array<ComponentRayHit>();
+        auto states = entities.template get_array<ComponentPathState>();
+        auto cpaths = entities.template get_array<ComponentCameraPath>();
+        auto lpaths = entities.template get_array<ComponentLightPath>();
+
+        std::mutex merge_mutex;
+
+        scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
+            std::vector<uint32_t> loc_next;
+
+            for(size_t i = start; i < end; ++i)
+            {
+                uint32_t id  = ray_queue.q_translucent[i];
+                auto & ray   = rays[id];
+                auto & hit   = hits[id].hit;
+                auto & state = states[id];
+                const auto & mat = scene.materials[hit.material_index];
+
+                if (is_cam && cpaths[id].count < MAX_PATH_DEPTH) {
+                    cpaths[id].vertices[cpaths[id].count++] = {hit.point, hit.normal, state.throughput, mat.albedo, true};
+                } else if (!is_cam && lpaths[id].count < MAX_PATH_DEPTH) {
+                    lpaths[id].vertices[lpaths[id].count++] = {hit.point, hit.normal, state.throughput, mat.albedo, true};
+                }
+
+                // Determine if we are entering or exiting the medium
+                float ndotd = ray.direction.dot(hit.normal);
+                Normal3f outward_normal = ndotd > 0.0f ? -hit.normal : hit.normal;
+                float eta = ndotd > 0.0f ? mat.ior : (1.0f / mat.ior);
+                float cos_theta_i = std::min(-ndotd, 1.0f);
+                if (ndotd > 0.0f) cos_theta_i = ndotd; // Inside to outside
+
+                // Schlick's approximation for Fresnel reflectance
+                float r0 = (1.0f - eta) / (1.0f + eta);
+                r0 = r0 * r0;
+                float R = r0 + (1.0f - r0) * std::pow(1.0f - cos_theta_i, 5.0f);
+
+                // Total Internal Reflection check
+                float sin_theta_t_sq = eta * eta * (1.0f - cos_theta_i * cos_theta_i);
+                if (sin_theta_t_sq > 1.0f) {
+                    R = 1.0f; // TIR
+                }
+
+                Vector3f scatter_dir;
+                if (state.rng.next_float() < R) {
+                    // Reflect
+                    scatter_dir = ray.direction - hit.normal * 2.0f * ndotd;
+                } else {
+                    // Refract
+                    float cos_theta_t = std::sqrt(1.0f - sin_theta_t_sq);
+                    scatter_dir = ray.direction * eta + outward_normal * (eta * cos_theta_i - cos_theta_t);
+                }
+                
+                if (mat.roughness > 0.0f) {
+                    scatter_dir = scatter_dir + random_in_unit_sphere(state.rng) * mat.roughness;
+                }
+                
+                scatter_dir = scatter_dir.normalize();
+
+                // Move origin along the normal relative to the direction of propagation 
+                // to prevent self-intersection. Bias slightly inward if refracting!
+                float bias_dir = scatter_dir.dot(hit.normal) > 0.0f ? 1.0f : -1.0f;
+                ray.origin    = hit.point + hit.normal * (0.001f * bias_dir);
+                ray.direction = scatter_dir;
+                ray.t_max     = 1000.0f;
+
+                state.throughput = state.throughput * mat.albedo;
+                state.depth++;
+                state.last_bounce_specular = true;
+
+                if (state.depth < MAX_PATH_DEPTH) {
+                    loc_next.push_back(id);
+                } else {
+                    state.active = false;
+                }
+            }
+
+            std::lock_guard<std::mutex> lock(merge_mutex);
+            ray_queue.next_rays.insert(ray_queue.next_rays.end(), loc_next.begin(), loc_next.end());
+        });
+    }
+};
 struct SystemEvaluateLambert
 {
     using WriteComponent = Usagi::ComponentList<ComponentRay, ComponentPathState, ComponentCameraPath, ComponentLightPath>;
@@ -777,7 +886,7 @@ struct SystemEvaluateLambert
                 onb.build_from_w(hit.normal);
                 Vector3f scatter_dir = onb.local(cosine_sample_hemisphere(state.rng.next_float(), state.rng.next_float()));
 
-                ray.origin    = hit.point;
+                ray.origin    = hit.point + hit.normal * 0.001f;
                 ray.direction = scatter_dir.normalize();
                 ray.t_max     = 1000.0f;
 
@@ -853,8 +962,8 @@ struct SystemEvaluateMetal
                 }
 
                 if(target.dot(hit.normal) > 0.0f) {
-                    ray.origin    = hit.point;
                     ray.direction = target.normalize();
+                    ray.origin    = hit.point + hit.normal * 0.001f;
                     ray.t_max     = 1000.0f;
 
                     state.throughput = state.throughput * mat.albedo;
@@ -1075,6 +1184,9 @@ struct SystemPathTracingCoordinator
 
         SystemEvaluateMetal sys_metal;
         sys_metal.update(entities, services);
+
+        SystemEvaluateTranslucent sys_translucent;
+        sys_translucent.update(entities, services);
 
         SystemEvaluateLight sys_light;
         sys_light.update(entities, services);
