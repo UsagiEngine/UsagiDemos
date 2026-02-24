@@ -898,11 +898,6 @@ struct SystemConnectPaths
 
                 Color3f total_L = state.radiance; // Includes NEE
 
-                if (cpath.direct_emission.x > 0 || cpath.direct_emission.y > 0 || cpath.direct_emission.z > 0) {
-                    float mis_weight = 1.0f / (cpath.direct_depth + 1.0f);
-                    total_L += cpath.direct_emission * mis_weight;
-                }
-
                 for (int t = 1; t <= cpath.count; ++t) {
                     auto & cv = cpath.vertices[t - 1];
                     if (cv.is_delta) continue;
@@ -926,11 +921,16 @@ struct SystemConnectPaths
                                 Color3f brdf_l = lv.albedo * (1.0f / PI);
                                 Color3f contrib = cv.beta * brdf_c * G * brdf_l * lv.beta;
                                 
-                                float mis_weight = 1.0f / (s + t + 1.0f);
+                                float mis_weight = 1.0f; // Simplified weighting for un-optimized heuristic
                                 total_L += contrib * mis_weight;
                             }
                         }
                     }
+                }
+
+                // Add explicit camera direct hit emission (for non-BDPT pure hit paths)
+                if (cpath.direct_emission.x > 0.0f || cpath.direct_emission.y > 0.0f || cpath.direct_emission.z > 0.0f) {
+                     total_L += cpath.direct_emission;
                 }
 
                 film.add_sample(state.sample_x, state.sample_y, total_L);
