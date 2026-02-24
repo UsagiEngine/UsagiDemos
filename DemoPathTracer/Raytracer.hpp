@@ -1,10 +1,11 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
-#include <vector>
-#include <optional>
 #include <numbers>
+#include <optional>
+#include <vector>
 
 #include "UsagiCore.hpp"
 
@@ -21,6 +22,7 @@ struct Vector3f
     float x, y, z;
 
     float & operator[](int i) { return (&x)[i]; }
+
     const float & operator[](int i) const { return (&x)[i]; }
 
     Vector3f operator-() const { return { -x, -y, -z }; }
@@ -32,7 +34,10 @@ struct Vector3f
 
     Vector3f & operator+=(const Vector3f & o)
     {
-        x += o.x; y += o.y; z += o.z; return *this;
+        x += o.x;
+        y += o.y;
+        z += o.z;
+        return *this;
     }
 
     Vector3f operator-(const Vector3f & o) const
@@ -55,6 +60,7 @@ struct Vector3f
     }
 
     float length_squared() const { return x * x + y * y + z * z; }
+
     float length() const { return std::sqrt(length_squared()); }
 
     Vector3f normalize() const
@@ -75,7 +81,7 @@ struct XorShift32
 {
     uint32_t state;
 
-    void seed(uint32_t s) { state = s ? s : 1337; }
+    void seed(uint32_t s) { state = s ? s : 1'337; }
 
     uint32_t next_u32()
     {
@@ -88,10 +94,7 @@ struct XorShift32
     }
 
     // Returns float in [0, 1)
-    float next_float()
-    {
-        return (next_u32() & 0xFFFFFF) / 16777216.0f;
-    }
+    float next_float() { return (next_u32() & 0xFF'FFFF) / 16777216.0f; }
 };
 
 /*
@@ -102,11 +105,9 @@ inline Vector3f random_in_unit_sphere(XorShift32 & rng)
 {
     while(true)
     {
-        Vector3f p = {
+        Vector3f p = { rng.next_float() * 2.0f - 1.0f,
             rng.next_float() * 2.0f - 1.0f,
-            rng.next_float() * 2.0f - 1.0f,
-            rng.next_float() * 2.0f - 1.0f
-        };
+            rng.next_float() * 2.0f - 1.0f };
         if(p.length_squared() < 1.0f) return p;
     }
 }
@@ -119,7 +120,7 @@ enum class MaterialType
 {
     Lambert,
     Metal,
-    Light
+    Light,
 };
 
 struct Material
@@ -144,13 +145,14 @@ struct Sphere
     float    radius;
     int      material_index;
 
-    std::optional<float> intersect(const Vector3f & o, const Vector3f & d, float t_min, float t_max) const
+    std::optional<float> intersect(
+        const Vector3f & o, const Vector3f & d, float t_min, float t_max) const
     {
-        Vector3f oc = o - center;
-        float a = d.length_squared();
-        float half_b = oc.dot(d);
-        float c = oc.length_squared() - radius * radius;
-        float discriminant = half_b * half_b - a * c;
+        Vector3f oc           = o - center;
+        float    a            = d.length_squared();
+        float    half_b       = oc.dot(d);
+        float    c            = oc.length_squared() - radius * radius;
+        float    discriminant = half_b * half_b - a * c;
 
         if(discriminant < 0) return std::nullopt;
         float sqrtd = std::sqrt(discriminant);
@@ -174,18 +176,20 @@ struct Box
     Vector3f max;
     int      material_index;
 
-    std::optional<float> intersect(const Vector3f & o, const Vector3f & d, float t_min, float t_max) const
+    std::optional<float> intersect(
+        const Vector3f & o, const Vector3f & d, float t_min, float t_max) const
     {
         float t0 = t_min, t1 = t_max;
-        
-        for (int i = 0; i < 3; ++i) {
-            float invD = 1.0f / d[i];
+
+        for(int i = 0; i < 3; ++i)
+        {
+            float invD  = 1.0f / d[i];
             float tNear = (min[i] - o[i]) * invD;
             float tFar  = (max[i] - o[i]) * invD;
-            if (invD < 0.0f) std::swap(tNear, tFar);
+            if(invD < 0.0f) std::swap(tNear, tFar);
             t0 = tNear > t0 ? tNear : t0;
-            t1 = tFar  < t1 ? tFar  : t1;
-            if (t1 <= t0) return std::nullopt;
+            t1 = tFar < t1 ? tFar : t1;
+            if(t1 <= t0) return std::nullopt;
         }
         return t0;
     }
@@ -194,13 +198,13 @@ struct Box
     {
         // Determine which face we hit
         const float epsilon = 0.0001f;
-        if (std::abs(p.x - min.x) < epsilon) return {-1, 0, 0};
-        if (std::abs(p.x - max.x) < epsilon) return { 1, 0, 0};
-        if (std::abs(p.y - min.y) < epsilon) return { 0,-1, 0};
-        if (std::abs(p.y - max.y) < epsilon) return { 0, 1, 0};
-        if (std::abs(p.z - min.z) < epsilon) return { 0, 0,-1};
-        if (std::abs(p.z - max.z) < epsilon) return { 0, 0, 1};
-        return {0, 1, 0};
+        if(std::abs(p.x - min.x) < epsilon) return { -1, 0, 0 };
+        if(std::abs(p.x - max.x) < epsilon) return { 1, 0, 0 };
+        if(std::abs(p.y - min.y) < epsilon) return { 0, -1, 0 };
+        if(std::abs(p.y - max.y) < epsilon) return { 0, 1, 0 };
+        if(std::abs(p.z - min.z) < epsilon) return { 0, 0, -1 };
+        if(std::abs(p.z - max.z) < epsilon) return { 0, 0, 1 };
+        return { 0, 1, 0 };
     }
 };
 
@@ -240,10 +244,10 @@ struct ComponentPathState
 
 struct ServiceGDICanvasProvider
 {
-    uint32_t * pixel_buffer;
-    int        width;
-    int        height;
-    int        frame_count = 0;
+    uint32_t *       pixel_buffer;
+    int              width;
+    int              height;
+    std::atomic<int> frame_count = 0;
 };
 
 /*
@@ -255,21 +259,22 @@ struct ServiceScene
     std::vector<Box>      boxes;
     std::vector<Material> materials;
 
-    std::optional<HitRecord> intersect(const Vector3f & o, const Vector3f & d, float t_max)
+    std::optional<HitRecord> intersect(
+        const Vector3f & o, const Vector3f & d, float t_max)
     {
         HitRecord rec;
-        rec.t = t_max;
+        rec.t             = t_max;
         bool hit_anything = false;
 
         for(const auto & s : spheres)
         {
             if(auto t = s.intersect(o, d, 0.001f, rec.t))
             {
-                rec.t = *t;
-                rec.point = o + d * rec.t;
-                rec.normal = (rec.point - s.center).normalize();
+                rec.t              = *t;
+                rec.point          = o + d * rec.t;
+                rec.normal         = (rec.point - s.center).normalize();
                 rec.material_index = s.material_index;
-                hit_anything = true;
+                hit_anything       = true;
             }
         }
 
@@ -277,11 +282,11 @@ struct ServiceScene
         {
             if(auto t = b.intersect(o, d, 0.001f, rec.t))
             {
-                rec.t = *t;
-                rec.point = o + d * rec.t;
-                rec.normal = b.get_normal(rec.point);
+                rec.t              = *t;
+                rec.point          = o + d * rec.t;
+                rec.normal         = b.get_normal(rec.point);
                 rec.material_index = b.material_index;
-                hit_anything = true;
+                hit_anything       = true;
             }
         }
 
@@ -305,38 +310,47 @@ struct SystemGenerateCameraRays
         canvas.frame_count++;
 
         Vector3f cam_pos = { 0.0f, 5.0f, -18.0f }; // Moved back to see full box
-        float aspect_ratio = static_cast<float>(canvas.width) / static_cast<float>(canvas.height);
+        float    aspect_ratio = static_cast<float>(canvas.width) /
+            static_cast<float>(canvas.height);
 
-        entities.template query<ComponentPixel, ComponentRay, ComponentPathState>()(
-            [&](ComponentPixel & pixel, ComponentRay & ray, ComponentPathState & state) {
-                
-                // Initialize RNG once per pixel
-                if(state.rng.state == 0) {
-                    state.rng.seed(pixel.y * canvas.width + pixel.x + 1);
-                }
+        entities
+            .template query<ComponentPixel, ComponentRay, ComponentPathState>()(
+                [&](ComponentPixel &     pixel,
+                    ComponentRay &       ray,
+                    ComponentPathState & state) {
+                    // Initialize RNG once per pixel
+                    if(state.rng.state == 0)
+                    {
+                        state.rng.seed(pixel.y * canvas.width + pixel.x + 1);
+                    }
 
-                // Jitter for anti-aliasing
-                float u = (pixel.x + state.rng.next_float()) / (float)canvas.width;
-                float v = (pixel.y + state.rng.next_float()) / (float)canvas.height;
-                
-                // NDC to Camera Space
-                float px = (2.0f * u - 1.0f) * aspect_ratio;
-                float py = 1.0f - 2.0f * v;
+                    // Jitter for anti-aliasing
+                    float u = (pixel.x + state.rng.next_float()) /
+                        (float)canvas.width;
+                    float v = (pixel.y + state.rng.next_float()) /
+                        (float)canvas.height;
 
-                ray.origin = cam_pos;
-                ray.direction = Vector3f { px, py, 1.0f }.normalize(); // looking down +Z
-                ray.t_max = 1000.0f;
+                    // NDC to Camera Space
+                    float px = (2.0f * u - 1.0f) * aspect_ratio;
+                    float py = 1.0f - 2.0f * v;
 
-                // Reset path state for new sample
-                state.throughput = { 1.0f, 1.0f, 1.0f };
-                
-                // For progressive rendering: only clear accumulation on the first frame.
-                // If the user wants to restart, they would reset frame_count.
-                if (canvas.frame_count == 1) state.accumulated_radiance = {0,0,0};
-                
-                state.depth = 0;
-                state.active = true;
-            });
+                    ray.origin    = cam_pos;
+                    ray.direction = Vector3f { px, py, 1.0f }
+                                        .normalize(); // looking down +Z
+                    ray.t_max = 1000.0f;
+
+                    // Reset path state for new sample
+                    state.throughput = { 1.0f, 1.0f, 1.0f };
+
+                    // For progressive rendering: only clear accumulation on the
+                    // first frame. If the user wants to restart, they would
+                    // reset frame_count.
+                    if(canvas.frame_count == 1)
+                        state.accumulated_radiance = { 0, 0, 0 };
+
+                    state.depth  = 0;
+                    state.active = true;
+                });
     }
 };
 
@@ -354,14 +368,16 @@ struct SystemPathBounce
             [&](ComponentRay & ray, ComponentPathState & state) {
                 if(!state.active) return;
 
-                auto hit = scene.intersect(ray.origin, ray.direction, ray.t_max);
+                auto hit =
+                    scene.intersect(ray.origin, ray.direction, ray.t_max);
 
                 if(hit)
                 {
                     const auto & mat = scene.materials[hit->material_index];
 
                     // Emissive contribution
-                    state.accumulated_radiance += state.throughput * mat.emission;
+                    state.accumulated_radiance +=
+                        state.throughput * mat.emission;
 
                     // Scatter
                     if(mat.type == MaterialType::Light || state.depth >= 5)
@@ -372,12 +388,13 @@ struct SystemPathBounce
 
                     // Lambertian Scatter
                     // Target = point + normal + random_unit_vector
-                    Vector3f target = hit->point + hit->normal + random_in_unit_sphere(state.rng).normalize();
-                    
-                    ray.origin = hit->point;
+                    Vector3f target = hit->point + hit->normal +
+                        random_in_unit_sphere(state.rng).normalize();
+
+                    ray.origin    = hit->point;
                     ray.direction = (target - hit->point).normalize();
-                    ray.t_max = 1000.0f;
-                    
+                    ray.t_max     = 1000.0f;
+
                     state.throughput = state.throughput * mat.albedo;
                     state.depth++;
                 }
@@ -395,22 +412,24 @@ struct SystemRenderGDICanvas
     void update(auto && entities, auto && services)
     {
         auto & canvas = services.template get<ServiceGDICanvasProvider>();
-        float scale = 1.0f / (float)std::max(1, canvas.frame_count);
+        float  scale  = 1.0f / (float)std::max(1, canvas.frame_count.load());
 
         entities.template query<ComponentPixel, ComponentPathState>()(
             [&](ComponentPixel & pixel, ComponentPathState & state) {
-                
                 // Average samples
-                Color3f color = state.accumulated_radiance * scale; 
-                
+                Color3f color = state.accumulated_radiance * scale;
+
                 // Simple Gamma Correction (approximate sqrt)
                 float r_f = std::sqrt(color.x);
                 float g_f = std::sqrt(color.y);
                 float b_f = std::sqrt(color.z);
 
-                uint8_t r = static_cast<uint8_t>(std::clamp(r_f * 255.0f, 0.0f, 255.0f));
-                uint8_t g = static_cast<uint8_t>(std::clamp(g_f * 255.0f, 0.0f, 255.0f));
-                uint8_t b = static_cast<uint8_t>(std::clamp(b_f * 255.0f, 0.0f, 255.0f));
+                uint8_t r = static_cast<uint8_t>(
+                    std::clamp(r_f * 255.0f, 0.0f, 255.0f));
+                uint8_t g = static_cast<uint8_t>(
+                    std::clamp(g_f * 255.0f, 0.0f, 255.0f));
+                uint8_t b = static_cast<uint8_t>(
+                    std::clamp(b_f * 255.0f, 0.0f, 255.0f));
 
                 canvas.pixel_buffer[pixel.y * canvas.width + pixel.x] =
                     (r << 16) | (g << 8) | b;
