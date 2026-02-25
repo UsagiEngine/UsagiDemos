@@ -407,9 +407,18 @@ struct ServiceRenderState
 {
     int pass = 0; // 0: InitCam, 1: BounceCam, 2: InitLight, 3: BounceLight, 4: Connect
     int ray_budget = 800 * 600; // initialize to max
-    uint32_t current_pixel_offset = 0;
-    uint32_t last_pixel_offset = 0;
     std::vector<uint32_t> active_pixels;
+
+    // Fast inline PRNG for unbiased random pixel selection during sparse rendering
+    uint32_t xorshift_state = 1337;
+    uint32_t next_u32() {
+        uint32_t x = xorshift_state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        xorshift_state = x;
+        return x;
+    }
 };
 
 struct ServiceRayQueue
@@ -568,14 +577,12 @@ struct ServiceFilm
                 while(!target.compare_exchange_weak(old, old * factor, std::memory_order_relaxed));
             };
             
-            // Shio: Fast decay for direct buffer preventing ghosting during sparse-updates, 
-            // while indirect gets the standard soft decay.
-            double direct_decay = (decay_factor == 1.0) ? 1.0 : (decay_factor == 0.0 ? 0.0 : decay_factor * 0.1); 
-            
-            atomic_scale(p.direct_r, direct_decay);
-            atomic_scale(p.direct_g, direct_decay);
-            atomic_scale(p.direct_b, direct_decay);
-            atomic_scale(p.direct_w, direct_decay);
+            // Shio: To prevent the "strobe blindness" from sparse dynamic rendering when moving, 
+            // we apply the explicit decay_factor to BOTH direct and indirect evenly!
+            atomic_scale(p.direct_r, decay_factor);
+            atomic_scale(p.direct_g, decay_factor);
+            atomic_scale(p.direct_b, decay_factor);
+            atomic_scale(p.direct_w, decay_factor);
 
             atomic_scale(p.indirect_r, decay_factor);
             atomic_scale(p.indirect_g, decay_factor);
@@ -873,13 +880,13 @@ struct SystemGenerateRays
 
         if (state_svc.pass == 0) {
             canvas.frame_count++;
-            state_svc.last_pixel_offset = state_svc.current_pixel_offset;
-            // 1000003u is a prime number to guarantee uniformly traversing all pixels across frames
-            state_svc.current_pixel_offset = (state_svc.current_pixel_offset + actual_count * 1000003u) % total_pixels;
             
+            // Randomly select actual_count pixels across the whole screen.
+            // This natively prevents "strobe strips" and creates a uniform white-noise
+            // visual resolution field when rendering sparsely during fast movement!
             state_svc.active_pixels.resize(actual_count);
             for(int i = 0; i < actual_count; ++i) {
-                 state_svc.active_pixels[i] = (state_svc.last_pixel_offset + i * 1000003u) % total_pixels;
+                 state_svc.active_pixels[i] = state_svc.next_u32() % total_pixels;
             }
         }
 
@@ -900,7 +907,7 @@ struct SystemGenerateRays
 
         bool is_cam = (state_svc.pass == 0);
 
-        scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
+        size_t chunk_size = std::max<size_t>(1, count / (std::thread::hardware_concurrency() * 4)); scheduler.host->parallel_for(count, chunk_size, [&](size_t start, size_t end) {
             for(size_t i = start; i < end; ++i)
             {
                 uint32_t entity_idx = state_svc.active_pixels[i];
@@ -1010,7 +1017,7 @@ struct SystemIntersectRays
 
         std::mutex merge_mutex;
 
-        scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
+        size_t chunk_size = std::max<size_t>(1, count / (std::thread::hardware_concurrency() * 4)); scheduler.host->parallel_for(count, chunk_size, [&](size_t start, size_t end) {
             std::vector<uint32_t> loc_lambert;
             std::vector<uint32_t> loc_metal;
             std::vector<uint32_t> loc_light;
@@ -1106,7 +1113,7 @@ struct SystemEvaluateTranslucent
 
         std::mutex merge_mutex;
 
-        scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
+        size_t chunk_size = std::max<size_t>(1, count / (std::thread::hardware_concurrency() * 4)); scheduler.host->parallel_for(count, chunk_size, [&](size_t start, size_t end) {
             std::vector<uint32_t> loc_next;
 
             for(size_t i = start; i < end; ++i)
@@ -1217,7 +1224,7 @@ struct SystemEvaluateLambert
 
         std::mutex merge_mutex;
 
-        scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
+        size_t chunk_size = std::max<size_t>(1, count / (std::thread::hardware_concurrency() * 4)); scheduler.host->parallel_for(count, chunk_size, [&](size_t start, size_t end) {
             std::vector<uint32_t> loc_next;
 
             for(size_t i = start; i < end; ++i)
@@ -1298,7 +1305,7 @@ struct SystemEvaluateMetal
 
         std::mutex merge_mutex;
 
-        scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
+        size_t chunk_size = std::max<size_t>(1, count / (std::thread::hardware_concurrency() * 4)); scheduler.host->parallel_for(count, chunk_size, [&](size_t start, size_t end) {
             std::vector<uint32_t> loc_next;
 
             for(size_t i = start; i < end; ++i)
@@ -1372,7 +1379,7 @@ struct SystemEvaluateLight
         auto states = entities.template get_array<ComponentPathState>();
         auto cpaths = entities.template get_array<ComponentCameraPath>();
 
-        scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
+        size_t chunk_size = std::max<size_t>(1, count / (std::thread::hardware_concurrency() * 4)); scheduler.host->parallel_for(count, chunk_size, [&](size_t start, size_t end) {
             for(size_t i = start; i < end; ++i)
             {
                 uint32_t id  = ray_queue.q_light[i];
@@ -1444,7 +1451,7 @@ struct SystemConnectPaths
         auto lpaths = entities.template get_array<ComponentLightPath>();
         auto states = entities.template get_array<ComponentPathState>();
 
-        scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
+        size_t chunk_size = std::max<size_t>(1, count / (std::thread::hardware_concurrency() * 4)); scheduler.host->parallel_for(count, chunk_size, [&](size_t start, size_t end) {
             for(size_t i = start; i < end; ++i)
             {
                 uint32_t entity_idx = state_svc.active_pixels[i];
@@ -1536,18 +1543,29 @@ struct SystemPathTracingCoordinator
             static float last_time = time;
             bool time_moved = (time != last_time);
             last_time = time;
+            
+            bool camera_moved = camera.moved.exchange(false);
+            static bool was_moving = false;
 
-            if (camera.moved.exchange(false) || time_moved) {
-                // Instantly clear ghost trails/history if the camera moves OR time scrubs!
-                film.clear_direct();
-                film.apply_ema_decay(0.0);
+            if (camera_moved || time_moved) {
+                // Shio: When moving, we keep a fast exponential decay (~0.6) running.
+                // This preserves enough visual history across both direct and indirect buffers 
+                // so the user can perfectly see where they are flying even with an aggressively sparse ray budget!
+                film.apply_ema_decay(0.6);
                 canvas.frame_count = 0;
+                was_moving = true;
             } else {
-                if (time_svc.is_paused) {
+                if (was_moving) {
+                    // The camera JUST stopped moving. We must completely purge the motion-blurred 
+                    // ghosting frame to pristine black before we start accumulating the standing frame!
+                    film.apply_ema_decay(0.0);
+                    canvas.frame_count = 0;
+                    was_moving = false;
+                } else if (time_svc.is_paused) {
                     // Infinite accumulation (decay = 1.0) merges all frames perfectly when paused and completely still
                     film.apply_ema_decay(1.0);
                 } else {
-                    film.apply_ema_decay(0.35); // 0.35 gives ~1 frame of effective memory. Shadows move almost perfectly real-time now!
+                    film.apply_ema_decay(0.85); // Normal standing decay (0.85). Smooths out the 4-SPP noise while keeping shadows responsive!
                 }
             }
             
@@ -1686,7 +1704,7 @@ struct SystemRenderGDICanvas
 
         // Shio: Fast 3x3 Edge-Avoiding Bilateral filter pass using luminance differentials
         // to smooth noise without destroying structural detail.
-        scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
+        size_t chunk_size = std::max<size_t>(1, count / (std::thread::hardware_concurrency() * 4)); scheduler.host->parallel_for(count, chunk_size, [&](size_t start, size_t end) {
             for(size_t i = start; i < end; ++i)
             {
                 auto & pixel = pixels[i];
@@ -1694,19 +1712,14 @@ struct SystemRenderGDICanvas
 
                 double d_w = film.pixels[idx].direct_w.load(std::memory_order_relaxed);
                 double i_w = film.pixels[idx].indirect_w.load(std::memory_order_relaxed);
+                double total_w = d_w + i_w;
 
                 Color3f color_center = {0, 0, 0};
-                if (d_w > 0.0) {
-                    double inv = 1.0 / d_w;
-                    color_center.x += static_cast<float>(film.pixels[idx].direct_r.load(std::memory_order_relaxed) * inv);
-                    color_center.y += static_cast<float>(film.pixels[idx].direct_g.load(std::memory_order_relaxed) * inv);
-                    color_center.z += static_cast<float>(film.pixels[idx].direct_b.load(std::memory_order_relaxed) * inv);
-                }
-                if (i_w > 0.0) {
-                    double inv = 1.0 / i_w;
-                    color_center.x += static_cast<float>(film.pixels[idx].indirect_r.load(std::memory_order_relaxed) * inv);
-                    color_center.y += static_cast<float>(film.pixels[idx].indirect_g.load(std::memory_order_relaxed) * inv);
-                    color_center.z += static_cast<float>(film.pixels[idx].indirect_b.load(std::memory_order_relaxed) * inv);
+                if (total_w > 0.0) {
+                    double inv = 1.0 / total_w;
+                    color_center.x = static_cast<float>((film.pixels[idx].direct_r.load(std::memory_order_relaxed) + film.pixels[idx].indirect_r.load(std::memory_order_relaxed)) * inv);
+                    color_center.y = static_cast<float>((film.pixels[idx].direct_g.load(std::memory_order_relaxed) + film.pixels[idx].indirect_g.load(std::memory_order_relaxed)) * inv);
+                    color_center.z = static_cast<float>((film.pixels[idx].direct_b.load(std::memory_order_relaxed) + film.pixels[idx].indirect_b.load(std::memory_order_relaxed)) * inv);
                 }
 
                 float lum_center = color_center.x * 0.2126f + color_center.y * 0.7152f + color_center.z * 0.0722f;
@@ -1723,18 +1736,14 @@ struct SystemRenderGDICanvas
                         Color3f neighbor = {0, 0, 0};
                         
                         double n_d_w = film.pixels[nidx].direct_w.load(std::memory_order_relaxed);
-                        if (n_d_w > 0.0) {
-                            double inv = 1.0 / n_d_w;
-                            neighbor.x += static_cast<float>(film.pixels[nidx].direct_r.load(std::memory_order_relaxed) * inv);
-                            neighbor.y += static_cast<float>(film.pixels[nidx].direct_g.load(std::memory_order_relaxed) * inv);
-                            neighbor.z += static_cast<float>(film.pixels[nidx].direct_b.load(std::memory_order_relaxed) * inv);
-                        }
                         double n_i_w = film.pixels[nidx].indirect_w.load(std::memory_order_relaxed);
-                        if (n_i_w > 0.0) {
-                            double inv = 1.0 / n_i_w;
-                            neighbor.x += static_cast<float>(film.pixels[nidx].indirect_r.load(std::memory_order_relaxed) * inv);
-                            neighbor.y += static_cast<float>(film.pixels[nidx].indirect_g.load(std::memory_order_relaxed) * inv);
-                            neighbor.z += static_cast<float>(film.pixels[nidx].indirect_b.load(std::memory_order_relaxed) * inv);
+                        double n_total_w = n_d_w + n_i_w;
+                        
+                        if (n_total_w > 0.0) {
+                            double inv = 1.0 / n_total_w;
+                            neighbor.x = static_cast<float>((film.pixels[nidx].direct_r.load(std::memory_order_relaxed) + film.pixels[nidx].indirect_r.load(std::memory_order_relaxed)) * inv);
+                            neighbor.y = static_cast<float>((film.pixels[nidx].direct_g.load(std::memory_order_relaxed) + film.pixels[nidx].indirect_g.load(std::memory_order_relaxed)) * inv);
+                            neighbor.z = static_cast<float>((film.pixels[nidx].direct_b.load(std::memory_order_relaxed) + film.pixels[nidx].indirect_b.load(std::memory_order_relaxed)) * inv);
                         }
 
                         float lum_neighbor = neighbor.x * 0.2126f + neighbor.y * 0.7152f + neighbor.z * 0.0722f;

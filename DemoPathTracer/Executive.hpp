@@ -224,6 +224,12 @@ public:
     void parallel_for(size_t count, size_t chunk_size, F && func)
     {
         if(count == 0) return;
+        
+        // Shio: Dynamically override the passed chunk_size to guarantee 100% 32-core occupancy 
+        // even when processing extremely small sparse-ray counts!
+        size_t hardware_threads = std::max<size_t>(1, std::thread::hardware_concurrency());
+        chunk_size = std::max<size_t>(1, count / (hardware_threads * 4));
+        
         size_t num_chunks = (count + chunk_size - 1) / chunk_size;
 
         std::atomic<size_t> next_chunk { 0 };

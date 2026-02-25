@@ -328,27 +328,45 @@ int WINAPI WinMain(
     
             while(g_RenderActive)
             {
-                // --- TIME AND INPUT UPDATE ---
-                auto current_time = std::chrono::high_resolution_clock::now();
-                float dt = std::chrono::duration<float>(current_time - last_time).count();
-                last_time = current_time;
-    
-                // --- Dynamic Ray Budget (Target ~60 FPS) ---
-                float target_dt = 1.0f / 60.0f;
-                if (dt > target_dt * 1.05f) {
-                    render_state.ray_budget = std::max(5000, int(render_state.ray_budget * 0.9f));
-                } else if (dt < target_dt * 0.95f) {
-                    render_state.ray_budget = std::min((int)PIXEL_COUNT, int(render_state.ray_budget * 1.05f));
-                }
-    
-                bool moved = false;
+                            // --- TIME AND INPUT UPDATE ---
+                            auto current_time = std::chrono::high_resolution_clock::now();
+                            float dt = std::chrono::duration<float>(current_time - last_time).count();
+                            last_time = current_time;
+                
+                            // --- Dynamic Ray Budget (Target ~90 FPS for maximum fluidity) ---
+                            float target_dt = 1.0f / 90.0f;
+                            if (dt > target_dt * 1.05f) {
+                                render_state.ray_budget = std::max(20000, int(render_state.ray_budget * 0.8f));
+                            } else if (dt < target_dt * 0.95f) {
+                                render_state.ray_budget = std::min((int)PIXEL_COUNT, int(render_state.ray_budget * 1.15f));
+                            }
+                
+                            bool moved = false;                
                 HWND foreground = GetForegroundWindow();
                 bool is_focused = (foreground == g_hWnd);
     
                 bool r_held = is_focused && (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
                 bool l_held = is_focused && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+                
+                static bool is_dragging_viewport = false;
+                
+                if (is_focused && (l_held || r_held)) {
+                    if (!is_dragging_viewport) {
+                        POINT pt;
+                        GetCursorPos(&pt);
+                        ScreenToClient(g_hWnd, &pt);
+                        RECT clientRect;
+                        GetClientRect(g_hWnd, &clientRect);
+                        if (PtInRect(&clientRect, pt)) {
+                            is_dragging_viewport = true;
+                            first_mouse = true; // reset delta to prevent snapping
+                        }
+                    }
+                } else {
+                    is_dragging_viewport = false;
+                }
     
-                if (is_focused) {
+                if (is_dragging_viewport) {
                     // Unreal Editor Style Mouse Input
                     if (l_held && r_held) {
                         // Both L and R: Pan vertically (World Y) and horizontally (Camera Right)
@@ -413,32 +431,33 @@ int WINAPI WinMain(
                                 moved = true;
                                 SetCursorPos(last_mouse_pos.x, last_mouse_pos.y);
                             }
-                        }
-                    } else {
-                        first_mouse = true;
-                    }
-    
-                    // Colemak Keyboard movement
-                    float speed = 10.0f * dt;
-                    if (GetAsyncKeyState(VK_SHIFT) & 0x8000) speed *= 3.0f;
-    
-                    RT::Vector3f fwd = camera.forward();
-                    RT::Vector3f right = camera.right();
-                    RT::Vector3f delta = {0, 0, 0};
-    
-                    if (GetAsyncKeyState('W') & 0x8000) delta += fwd;
-                    if (GetAsyncKeyState('R') & 0x8000) delta -= fwd;
-                    if (GetAsyncKeyState('A') & 0x8000) delta -= right;
-                    if (GetAsyncKeyState('S') & 0x8000) delta += right;
-                    
-                    if (delta.x != 0 || delta.y != 0 || delta.z != 0) {
-                        camera.position += delta.normalize() * speed;
-                        moved = true;
-                    }
-                } else {
-                    first_mouse = true; // Prevents sudden jerks when regaining focus
-                }
-    
+                                            }
+                                        } else {
+                                            first_mouse = true;
+                                        }
+                                        
+                                        if (is_focused) {
+                                            // Colemak Keyboard movement
+                                            float speed = 10.0f * dt;
+                                            if (GetAsyncKeyState(VK_SHIFT) & 0x8000) speed *= 3.0f;
+                            
+                                            RT::Vector3f fwd = camera.forward();
+                                            RT::Vector3f right = camera.right();
+                                            RT::Vector3f delta = {0, 0, 0};
+                            
+                                            if (GetAsyncKeyState('W') & 0x8000) delta += fwd;
+                                            if (GetAsyncKeyState('R') & 0x8000) delta -= fwd;
+                                            if (GetAsyncKeyState('A') & 0x8000) delta -= right;
+                                            if (GetAsyncKeyState('S') & 0x8000) delta += right;
+                                            
+                                            if (delta.x != 0 || delta.y != 0 || delta.z != 0) {
+                                                camera.position += delta.normalize() * speed;
+                                                moved = true;
+                                            }
+                                        }
+                                    } else {
+                                        first_mouse = true; // Prevents sudden jerks when regaining focus
+                                    }    
                 if (moved) camera.moved = true;
     
                 // Shio: Time Control
