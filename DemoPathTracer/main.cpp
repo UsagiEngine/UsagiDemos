@@ -183,6 +183,9 @@ int WINAPI WinMain(
     RT::ServiceCamera camera;
     services.register_service(&camera);
 
+    RT::ServiceTime time_svc;
+    services.register_service(&time_svc);
+
     RT::ServiceRenderState render_state;
     services.register_service(&render_state);
 
@@ -360,6 +363,34 @@ int WINAPI WinMain(
         }
 
         if (moved) camera.moved = true;
+
+        // Shio: Time Control
+        // Physical P (Virtual Key VK_OEM_1 or ';' in Colemak layout) toggles pause
+        static bool was_pause_held = false;
+        bool pause_held = (GetAsyncKeyState(VK_OEM_1) & 0x8000) != 0;
+        if (pause_held && !was_pause_held) {
+            time_svc.is_paused = !time_svc.is_paused;
+        }
+        was_pause_held = pause_held;
+
+        // Physical R (Virtual Key 'P' in Colemak layout) unconditionally adds +1.5x time speed
+        // Physical E (Virtual Key 'F' in Colemak layout) unconditionally adds -1.5x time speed
+        float time_speed = 0.0f;
+        if (!time_svc.is_paused) {
+            time_speed += 1.0f; // Base speed when running normally
+        }
+        if (GetAsyncKeyState('P') & 0x8000) {
+            time_speed += 1.5f; // Fast forward
+        }
+        if (GetAsyncKeyState('F') & 0x8000) {
+            time_speed -= 1.5f; // Rewind
+        }
+
+        // Apply smooth time advancement
+        // 0.3f effectively matches the old 60fps * 0.005f pacing
+        if (time_speed != 0.0f) {
+            time_svc.current_time += dt * 0.3f * time_speed;
+        }
 
         // Present to Window (Main Thread)
         // We present as fast as the main thread can, or we could limit this.

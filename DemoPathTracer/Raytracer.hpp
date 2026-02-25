@@ -413,6 +413,12 @@ struct ServiceCamera
     }
 };
 
+struct ServiceTime
+{
+    float current_time = 0.0f;
+    bool is_paused = false;
+};
+
 /*
  * Shio: Thread-safe framebuffer supporting Temporal Anti-Aliasing (TAA)
  * with Variance/Neighborhood Clamping to eliminate ghosting and noise.
@@ -846,14 +852,9 @@ struct SystemGenerateRays
                 // Initialize RNG once per pixel
                 if(state.rng.inc == 0)
                 {
-                    state.rng.seed(pixel.y * canvas.width + pixel.x + 1, 1337);
-                    
-                    // Advance RNG by the current frame count so we don't repeat the exact 
-                    // same light/camera subpaths every single frame if the PRNG logic was flawed
-                    // or reset elsewhere. PCG32 is robust, but advancing ensures a unique temporal stream.
-                    for (int f = 0; f < canvas.frame_count.load(); ++f) {
-                        state.rng.next_u32();
-                    }
+                    // Shio: O(1) temporal seeding instead of looping. The frame count guarantees
+                    // a unique temporal stream of stochastic samples over time.
+                    state.rng.seed(pixel.y * canvas.width + pixel.x + 1, 1337 + canvas.frame_count.load());
                 }
 
                 state.throughput = { 1.0f, 1.0f, 1.0f };
@@ -1435,7 +1436,7 @@ struct SystemConnectPaths
 struct SystemPathTracingCoordinator
 {
     using ReadService  = Usagi::ComponentList<>;
-    using WriteService = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler, ServiceRenderState, ServiceCamera>;
+    using WriteService = Usagi::ComponentList<ServiceRayQueue, ServiceScheduler, ServiceRenderState, ServiceCamera, ServiceTime>;
 
     void update(auto && entities, auto && services)
     {
@@ -1446,26 +1447,34 @@ struct SystemPathTracingCoordinator
 
         // Start pass
         if (state_svc.pass == 0) {
-            auto & scene  = services.template get<ServiceScene>();
-            auto & film   = services.template get<ServiceFilm>();
-            auto & canvas = services.template get<ServiceGDICanvasProvider>();
-            auto & camera = services.template get<ServiceCamera>();
+            auto & scene    = services.template get<ServiceScene>();
+            auto & film     = services.template get<ServiceFilm>();
+            auto & canvas   = services.template get<ServiceGDICanvasProvider>();
+            auto & camera   = services.template get<ServiceCamera>();
+            auto & time_svc = services.template get<ServiceTime>();
 
-            if (camera.moved.exchange(false)) {
-                // Instantly clear ghost trails/history if the camera moves
+            // Read the dynamically driven time
+            float time = time_svc.current_time;
+
+            // Track if time is actively advancing (e.g., normal playback or forced fast-forward)
+            static float last_time = time;
+            bool time_moved = (time != last_time);
+            last_time = time;
+
+            if (camera.moved.exchange(false) || time_moved) {
+                // Instantly clear ghost trails/history if the camera moves OR time scrubs!
                 film.clear_direct();
                 film.apply_ema_decay(0.0);
                 canvas.frame_count = 0;
             } else {
-                // Clear the direct light accumulation buffer fully every frame.
-                // This prevents moving lights from leaving intense 100% white ghost trails,
-                // while EMA decay handles the indirect noisy bounces softly.
                 film.clear_direct();
-                film.apply_ema_decay(0.35); // 0.35 gives ~1 frame of effective memory. Shadows move almost perfectly real-time now!
+                if (time_svc.is_paused) {
+                    // Infinite accumulation (decay = 1.0) merges all frames perfectly when paused and completely still
+                    film.apply_ema_decay(1.0);
+                } else {
+                    film.apply_ema_decay(0.35); // 0.35 gives ~1 frame of effective memory. Shadows move almost perfectly real-time now!
+                }
             }
-
-            // Advance time significantly slower so the sun crawls smoothly across the sky
-            float time = canvas.frame_count.load() * 0.005f;
             
             // Sun orbits in YZ plane. Z > 0 is out the back wall.
             scene.sun_dir = Vector3f{ 0.0f, std::cos(time), std::sin(time) }.normalize();
