@@ -11,6 +11,7 @@
 // Global window handle for GDI calls
 HWND              g_hWnd = nullptr;
 std::atomic<bool> g_RenderActive { true };
+std::atomic<bool> g_KeyStates[256];
 
 /*
  * Shio: Standard Win32 Window Procedure.
@@ -21,6 +22,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     {
         PostQuitMessage(0);
         return 0;
+    }
+    if (uMsg == WM_KEYDOWN || uMsg == WM_KEYUP || uMsg == WM_SYSKEYDOWN || uMsg == WM_SYSKEYUP)
+    {
+        bool isDown = (uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN);
+        UINT scanCode = (lParam >> 16) & 0xFF;
+        g_KeyStates[scanCode].store(isDown, std::memory_order_relaxed);
+    }
+    if (uMsg == WM_KILLFOCUS)
+    {
+        for (int i = 0; i < 256; ++i) g_KeyStates[i].store(false, std::memory_order_relaxed);
     }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
@@ -308,31 +319,31 @@ int WINAPI WinMain(
     }
 
         SystemPresentToGDI sys_present;
-    
+
         // Shio: Launch the render thread
         // This true game loop runs completely decoupled from the OS message pump,
         // ensuring consistent input polling, time advancement, and rendering rates.
         std::thread render_thread([&]() {
             Usagi::TaskGraphExecutionHost host(std::thread::hardware_concurrency() * 2);
             scheduler.host = &host;
-    
+
             RT::SystemPathTracingCoordinator sys_coord;
             RT::SystemRenderGDICanvas        sys_render;
-    
+
             host.register_system(sys_coord, primary_group, services);
             host.build_graph();
-    
+
             auto last_time = std::chrono::high_resolution_clock::now();
             bool first_mouse = true;
             POINT last_mouse_pos = {0, 0};
-    
+
             while(g_RenderActive)
             {
                             // --- TIME AND INPUT UPDATE ---
                             auto current_time = std::chrono::high_resolution_clock::now();
                             float dt = std::chrono::duration<float>(current_time - last_time).count();
                             last_time = current_time;
-                
+
                             // --- Dynamic Ray Budget (Target ~90 FPS for maximum fluidity) ---
                             float target_dt = 1.0f / 90.0f;
                             if (dt > target_dt * 1.05f) {
@@ -340,16 +351,16 @@ int WINAPI WinMain(
                             } else if (dt < target_dt * 0.95f) {
                                 render_state.ray_budget = std::min((int)PIXEL_COUNT, int(render_state.ray_budget * 1.15f));
                             }
-                
-                            bool moved = false;                
+
+                            bool moved = false;
                 HWND foreground = GetForegroundWindow();
                 bool is_focused = (foreground == g_hWnd);
-    
+
                 bool r_held = is_focused && (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
                 bool l_held = is_focused && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-                
+
                 static bool is_dragging_viewport = false;
-                
+
                 if (is_focused && (l_held || r_held)) {
                     if (!is_dragging_viewport) {
                         POINT pt;
@@ -365,7 +376,7 @@ int WINAPI WinMain(
                 } else {
                     is_dragging_viewport = false;
                 }
-    
+
                 if (is_dragging_viewport) {
                     // Unreal Editor Style Mouse Input
                     if (l_held && r_held) {
@@ -378,7 +389,7 @@ int WINAPI WinMain(
                         } else {
                             float dx = (current_mouse.x - last_mouse_pos.x) * 0.05f;
                             float dy = (current_mouse.y - last_mouse_pos.y) * 0.05f;
-                            
+
                             if (dx != 0.0f || dy != 0.0f) {
                                 camera.position += camera.right() * dx; // standard X drag
                                 camera.position.y += -dy; // standard Y drag
@@ -396,7 +407,7 @@ int WINAPI WinMain(
                         } else {
                             float dx = (current_mouse.x - last_mouse_pos.x) * 0.005f;
                             float dy = (current_mouse.y - last_mouse_pos.y) * 0.005f;
-                            
+
                             if (dx != 0.0f || dy != 0.0f) {
                                 camera.yaw += dx; // Positive dx means looking right (+X)
                                 camera.pitch += dy;
@@ -415,10 +426,10 @@ int WINAPI WinMain(
                         } else {
                             float dx = (current_mouse.x - last_mouse_pos.x) * 0.005f;
                             float dy = (current_mouse.y - last_mouse_pos.y) * 0.05f;
-                            
+
                             if (dx != 0.0f || dy != 0.0f) {
-                                camera.yaw += dx; 
-                                
+                                camera.yaw += dx;
+
                                 RT::Vector3f flat_fwd = camera.forward();
                                 flat_fwd.y = 0.0f;
                                 if (flat_fwd.length_squared() > 0.0001f) {
@@ -426,80 +437,90 @@ int WINAPI WinMain(
                                 } else {
                                     flat_fwd = {0, 0, 1};
                                 }
-                                
+
                                 camera.position += flat_fwd * -dy;
                                 moved = true;
                                 SetCursorPos(last_mouse_pos.x, last_mouse_pos.y);
                             }
-                                            }
-                                        } else {
-                                            first_mouse = true;
-                                        }
-                                        
-                                        if (is_focused) {
-                                            // Colemak Keyboard movement
-                                            float speed = 10.0f * dt;
-                                            if (GetAsyncKeyState(VK_SHIFT) & 0x8000) speed *= 3.0f;
-                            
-                                            RT::Vector3f fwd = camera.forward();
-                                            RT::Vector3f right = camera.right();
-                                            RT::Vector3f delta = {0, 0, 0};
-                            
-                                            if (GetAsyncKeyState('W') & 0x8000) delta += fwd;
-                                            if (GetAsyncKeyState('R') & 0x8000) delta -= fwd;
-                                            if (GetAsyncKeyState('A') & 0x8000) delta -= right;
-                                            if (GetAsyncKeyState('S') & 0x8000) delta += right;
-                                            
-                                            if (delta.x != 0 || delta.y != 0 || delta.z != 0) {
-                                                camera.position += delta.normalize() * speed;
-                                                moved = true;
-                                            }
-                                        }
-                                    } else {
-                                        first_mouse = true; // Prevents sudden jerks when regaining focus
-                                    }    
+                        }
+                    } else {
+                        first_mouse = true;
+                    }
+                } else {
+                    first_mouse = true; // Prevents sudden jerks when regaining focus
+                }
+
+                if (is_focused) {
+                    // Shio: Raw hardware scan codes completely bypass Windows layout translation!
+                    // 0x11 = Physical W, 0x1E = Physical A, 0x1F = Physical S, 0x20 = Physical D
+                    bool key_W = g_KeyStates[0x11].load(std::memory_order_relaxed);
+                    bool key_A = g_KeyStates[0x1E].load(std::memory_order_relaxed);
+                    bool key_S = g_KeyStates[0x1F].load(std::memory_order_relaxed);
+                    bool key_D = g_KeyStates[0x20].load(std::memory_order_relaxed);
+                    bool key_Shift = g_KeyStates[0x2A].load(std::memory_order_relaxed);
+
+                    float speed = 10.0f * dt;
+                    if (key_Shift) speed *= 3.0f;
+
+                    RT::Vector3f fwd = camera.forward();
+                    RT::Vector3f right = camera.right();
+                    RT::Vector3f delta = {0, 0, 0};
+
+                    if (key_W) delta += fwd;
+                    if (key_S) delta -= fwd;
+                    if (key_A) delta -= right;
+                    if (key_D) delta += right;
+
+                    if (delta.x != 0 || delta.y != 0 || delta.z != 0) {
+                        camera.position += delta.normalize() * speed;
+                        moved = true;
+                    }
+                }
+
                 if (moved) camera.moved = true;
-    
+
                 // Shio: Time Control
                 static bool was_pause_held = false;
-                bool pause_held = is_focused && (GetAsyncKeyState(VK_OEM_1) & 0x8000) != 0;
+                // Scan Code 0x19 is the physical 'P' key
+                bool pause_held = is_focused && g_KeyStates[0x19].load(std::memory_order_relaxed);
                 if (pause_held && !was_pause_held) {
                     time_svc.is_paused = !time_svc.is_paused;
                 }
                 was_pause_held = pause_held;
-    
+
                 float time_speed = 0.0f;
                 if (!time_svc.is_paused) {
                     time_speed += 1.0f; // Base speed when running normally
                 }
-                if (is_focused && (GetAsyncKeyState('P') & 0x8000)) {
+                // Scan Code 0x13 is physical 'R' key
+                if (is_focused && g_KeyStates[0x13].load(std::memory_order_relaxed)) {
                     time_speed += 1.5f; // Fast forward
                 }
-                if (is_focused && (GetAsyncKeyState('F') & 0x8000)) {
+                // Scan Code 0x12 is physical 'E' key
+                if (is_focused && g_KeyStates[0x12].load(std::memory_order_relaxed)) {
                     time_speed -= 1.5f; // Rewind
                 }
-    
                 if (time_speed != 0.0f) {
                     time_svc.current_time += dt * 0.3f * time_speed;
                 }
-    
+
                 // --- RENDER PIPELINE ---
                 // Execute the BDPT state machine which orchestrates the sub-passes
                 host.execute();
-                
+
                 // Render the splatted film explicitly after the BDPT cycle completes
                 sys_render.update(primary_group, services);
-                
+
                 // Present to Window asynchronously inside the worker thread to free up the OS message pump
                 sys_present.update(primary_group, services);
             }
         });
-    
+
         // Main Message Loop (UI Thread only!)
         MSG msg = { };
         while(true)
         {
-            // Shio: GetMessage blocks, allowing the UI thread to sleep peacefully at 0% CPU 
+            // Shio: GetMessage blocks, allowing the UI thread to sleep peacefully at 0% CPU
             // while the background render_thread spins at maximum framerate!
             if (GetMessage(&msg, nullptr, 0, 0))
             {

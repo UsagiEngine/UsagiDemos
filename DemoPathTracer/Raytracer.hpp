@@ -406,7 +406,10 @@ struct ServiceScheduler
 struct ServiceRenderState
 {
     int pass = 0; // 0: InitCam, 1: BounceCam, 2: InitLight, 3: BounceLight, 4: Connect
-    int ray_budget = 800 * 600; // initialize to max
+    
+    // Shio: Boot extremely fast with exactly num_cores proportion of rays (e.g. 1/8th of screen on 32-core)
+    int ray_budget = (800 * 600) / std::max<int>(1, std::thread::hardware_concurrency() / 4); 
+    
     std::vector<uint32_t> active_pixels;
 
     // Fast inline PRNG for unbiased random pixel selection during sparse rendering
@@ -477,19 +480,45 @@ struct ServiceFilm
     };
 
     std::vector<Pixel> pixels;
+    std::vector<Pixel> expired_pixels; // Double-buffering state to smoothly decay motion-blur without blacking out!
+
     int width = 0;
     int height = 0;
     float filter_radius = 2.0f; // Mitchell filter radius
     float B = 1.0f / 3.0f;
     float C = 1.0f / 3.0f;
     float sample_weight_multiplier = 1.0f;
+    float expired_decay_scalar = 1.25f; // User tunable: 25% faster decay for expired ghost buffer
 
     void init(int w, int h, float rx = 2.0f, float ry = 2.0f)
     {
         width = w;
         height = h;
         pixels = std::vector<Pixel>(w * h);
+        expired_pixels = std::vector<Pixel>(w * h);
         filter_radius = rx;
+    }
+
+    void swap_to_expired() {
+        for(size_t i = 0; i < pixels.size(); ++i) {
+            expired_pixels[i].direct_r.store(pixels[i].direct_r.load());
+            expired_pixels[i].direct_g.store(pixels[i].direct_g.load());
+            expired_pixels[i].direct_b.store(pixels[i].direct_b.load());
+            expired_pixels[i].direct_w.store(pixels[i].direct_w.load());
+            expired_pixels[i].indirect_r.store(pixels[i].indirect_r.load());
+            expired_pixels[i].indirect_g.store(pixels[i].indirect_g.load());
+            expired_pixels[i].indirect_b.store(pixels[i].indirect_b.load());
+            expired_pixels[i].indirect_w.store(pixels[i].indirect_w.load());
+
+            pixels[i].direct_r.store(0.0);
+            pixels[i].direct_g.store(0.0);
+            pixels[i].direct_b.store(0.0);
+            pixels[i].direct_w.store(0.0);
+            pixels[i].indirect_r.store(0.0);
+            pixels[i].indirect_g.store(0.0);
+            pixels[i].indirect_b.store(0.0);
+            pixels[i].indirect_w.store(0.0);
+        }
     }
 
     void clear_direct() {
@@ -570,7 +599,7 @@ struct ServiceFilm
         }
     }
 
-    void apply_ema_decay(double decay_factor) {
+    void apply_ema_decay(double decay_factor, double expired_decay = 0.5) {
         for(auto& p : pixels) {
             auto atomic_scale = [](std::atomic<double>& target, double factor) {
                 double old = target.load(std::memory_order_relaxed);
@@ -588,6 +617,26 @@ struct ServiceFilm
             atomic_scale(p.indirect_g, decay_factor);
             atomic_scale(p.indirect_b, decay_factor);
             atomic_scale(p.indirect_w, decay_factor);
+        }
+
+        // Extremely aggressive decay for the motion-blurred ghost buffer.
+        // It disappears completely within ~3-5 frames (50% per frame),
+        // leaving only the crisp new samples behind without ever dipping to zero-energy black!
+        for(auto& p : expired_pixels) {
+            auto atomic_scale = [](std::atomic<double>& target, double factor) {
+                double old = target.load(std::memory_order_relaxed);
+                while(!target.compare_exchange_weak(old, old * factor, std::memory_order_relaxed));
+            };
+            
+            atomic_scale(p.direct_r, expired_decay);
+            atomic_scale(p.direct_g, expired_decay);
+            atomic_scale(p.direct_b, expired_decay);
+            atomic_scale(p.direct_w, expired_decay);
+
+            atomic_scale(p.indirect_r, expired_decay);
+            atomic_scale(p.indirect_g, expired_decay);
+            atomic_scale(p.indirect_b, expired_decay);
+            atomic_scale(p.indirect_w, expired_decay);
         }
     }
 };
@@ -1547,31 +1596,38 @@ struct SystemPathTracingCoordinator
             bool camera_moved = camera.moved.exchange(false);
             static bool was_moving = false;
 
+            // Energy compensation for dynamic sparse rendering scaling!
+            float fraction = (float)state_svc.ray_budget / (canvas.width * canvas.height);
+            film.sample_weight_multiplier = 1.0f / std::max(0.001f, fraction);
+            
+            // Align expired pixel decay dynamically to the ray spawn rate!
+            // If we spawn 10% of rays, fraction = 0.1. Decay base = 0.9.
+            // A tunable multiplier applies a 25% faster decay rate (0.9 ^ 1.25) so it aggressively fades out.
+            double expired_decay = std::clamp<double>(std::pow(1.0f - fraction, film.expired_decay_scalar), 0.0, 0.99);
+
             if (camera_moved || time_moved) {
-                // Shio: When moving, we keep a fast exponential decay (~0.6) running.
-                // This preserves enough visual history across both direct and indirect buffers 
-                // so the user can perfectly see where they are flying even with an aggressively sparse ray budget!
-                film.apply_ema_decay(0.6);
+                // Shio: Keep a trace going so user isn't blind during heavy movement
+                film.apply_ema_decay(0.6, 0.0); // Wipe expired immediately when moving
                 canvas.frame_count = 0;
                 was_moving = true;
             } else {
                 if (was_moving) {
-                    // The camera JUST stopped moving. We must completely purge the motion-blurred 
-                    // ghosting frame to pristine black before we start accumulating the standing frame!
-                    film.apply_ema_decay(0.0);
-                    canvas.frame_count = 0;
                     was_moving = false;
-                } else if (time_svc.is_paused) {
+                    // The exact moment movement stops:
+                    // 1. Shove the entire dirty motion-blurred frame into the rapidly decaying `expired` buffer.
+                    // 2. Clear the active buffer to 0.
+                    // 3. From now on, the clean active buffer builds up pure sparse samples and replaces the ghost perfectly!
+                    film.swap_to_expired();
+                    canvas.frame_count = 0;
+                }
+                
+                if (time_svc.is_paused) {
                     // Infinite accumulation (decay = 1.0) merges all frames perfectly when paused and completely still
-                    film.apply_ema_decay(1.0);
+                    film.apply_ema_decay(1.0, expired_decay);
                 } else {
-                    film.apply_ema_decay(0.85); // Normal standing decay (0.85). Smooths out the 4-SPP noise while keeping shadows responsive!
+                    film.apply_ema_decay(0.85, expired_decay); // Normal standing decay (0.85). Smooths out the 4-SPP noise while keeping shadows responsive!
                 }
             }
-            
-            // Energy compensation for dynamic sparse rendering scaling!
-            float fraction = (float)state_svc.ray_budget / (canvas.width * canvas.height);
-            film.sample_weight_multiplier = 1.0f / std::max(0.001f, fraction);
             
             // Sun orbits in YZ plane. Z > 0 is out the back wall.
             scene.sun_dir = Vector3f{ 0.0f, std::cos(time), std::sin(time) }.normalize();
@@ -1710,16 +1766,25 @@ struct SystemRenderGDICanvas
                 auto & pixel = pixels[i];
                 int idx = pixel.y * canvas.width + pixel.x;
 
-                double d_w = film.pixels[idx].direct_w.load(std::memory_order_relaxed);
-                double i_w = film.pixels[idx].indirect_w.load(std::memory_order_relaxed);
+                double d_w = film.pixels[idx].direct_w.load(std::memory_order_relaxed) + film.expired_pixels[idx].direct_w.load(std::memory_order_relaxed);
+                double i_w = film.pixels[idx].indirect_w.load(std::memory_order_relaxed) + film.expired_pixels[idx].indirect_w.load(std::memory_order_relaxed);
                 double total_w = d_w + i_w;
 
                 Color3f color_center = {0, 0, 0};
                 if (total_w > 0.0) {
                     double inv = 1.0 / total_w;
-                    color_center.x = static_cast<float>((film.pixels[idx].direct_r.load(std::memory_order_relaxed) + film.pixels[idx].indirect_r.load(std::memory_order_relaxed)) * inv);
-                    color_center.y = static_cast<float>((film.pixels[idx].direct_g.load(std::memory_order_relaxed) + film.pixels[idx].indirect_g.load(std::memory_order_relaxed)) * inv);
-                    color_center.z = static_cast<float>((film.pixels[idx].direct_b.load(std::memory_order_relaxed) + film.pixels[idx].indirect_b.load(std::memory_order_relaxed)) * inv);
+                    
+                    double active_sum_r = film.pixels[idx].direct_r.load(std::memory_order_relaxed) + film.pixels[idx].indirect_r.load(std::memory_order_relaxed);
+                    double active_sum_g = film.pixels[idx].direct_g.load(std::memory_order_relaxed) + film.pixels[idx].indirect_g.load(std::memory_order_relaxed);
+                    double active_sum_b = film.pixels[idx].direct_b.load(std::memory_order_relaxed) + film.pixels[idx].indirect_b.load(std::memory_order_relaxed);
+                    
+                    double exp_sum_r = film.expired_pixels[idx].direct_r.load(std::memory_order_relaxed) + film.expired_pixels[idx].indirect_r.load(std::memory_order_relaxed);
+                    double exp_sum_g = film.expired_pixels[idx].direct_g.load(std::memory_order_relaxed) + film.expired_pixels[idx].indirect_g.load(std::memory_order_relaxed);
+                    double exp_sum_b = film.expired_pixels[idx].direct_b.load(std::memory_order_relaxed) + film.expired_pixels[idx].indirect_b.load(std::memory_order_relaxed);
+
+                    color_center.x = static_cast<float>((active_sum_r + exp_sum_r) * inv);
+                    color_center.y = static_cast<float>((active_sum_g + exp_sum_g) * inv);
+                    color_center.z = static_cast<float>((active_sum_b + exp_sum_b) * inv);
                 }
 
                 float lum_center = color_center.x * 0.2126f + color_center.y * 0.7152f + color_center.z * 0.0722f;
@@ -1735,15 +1800,24 @@ struct SystemRenderGDICanvas
 
                         Color3f neighbor = {0, 0, 0};
                         
-                        double n_d_w = film.pixels[nidx].direct_w.load(std::memory_order_relaxed);
-                        double n_i_w = film.pixels[nidx].indirect_w.load(std::memory_order_relaxed);
+                        double n_d_w = film.pixels[nidx].direct_w.load(std::memory_order_relaxed) + film.expired_pixels[nidx].direct_w.load(std::memory_order_relaxed);
+                        double n_i_w = film.pixels[nidx].indirect_w.load(std::memory_order_relaxed) + film.expired_pixels[nidx].indirect_w.load(std::memory_order_relaxed);
                         double n_total_w = n_d_w + n_i_w;
                         
                         if (n_total_w > 0.0) {
                             double inv = 1.0 / n_total_w;
-                            neighbor.x = static_cast<float>((film.pixels[nidx].direct_r.load(std::memory_order_relaxed) + film.pixels[nidx].indirect_r.load(std::memory_order_relaxed)) * inv);
-                            neighbor.y = static_cast<float>((film.pixels[nidx].direct_g.load(std::memory_order_relaxed) + film.pixels[nidx].indirect_g.load(std::memory_order_relaxed)) * inv);
-                            neighbor.z = static_cast<float>((film.pixels[nidx].direct_b.load(std::memory_order_relaxed) + film.pixels[nidx].indirect_b.load(std::memory_order_relaxed)) * inv);
+                            
+                            double n_active_sum_r = film.pixels[nidx].direct_r.load(std::memory_order_relaxed) + film.pixels[nidx].indirect_r.load(std::memory_order_relaxed);
+                            double n_active_sum_g = film.pixels[nidx].direct_g.load(std::memory_order_relaxed) + film.pixels[nidx].indirect_g.load(std::memory_order_relaxed);
+                            double n_active_sum_b = film.pixels[nidx].direct_b.load(std::memory_order_relaxed) + film.pixels[nidx].indirect_b.load(std::memory_order_relaxed);
+
+                            double n_exp_sum_r = film.expired_pixels[nidx].direct_r.load(std::memory_order_relaxed) + film.expired_pixels[nidx].indirect_r.load(std::memory_order_relaxed);
+                            double n_exp_sum_g = film.expired_pixels[nidx].direct_g.load(std::memory_order_relaxed) + film.expired_pixels[nidx].indirect_g.load(std::memory_order_relaxed);
+                            double n_exp_sum_b = film.expired_pixels[nidx].direct_b.load(std::memory_order_relaxed) + film.expired_pixels[nidx].indirect_b.load(std::memory_order_relaxed);
+
+                            neighbor.x = static_cast<float>((n_active_sum_r + n_exp_sum_r) * inv);
+                            neighbor.y = static_cast<float>((n_active_sum_g + n_exp_sum_g) * inv);
+                            neighbor.z = static_cast<float>((n_active_sum_b + n_exp_sum_b) * inv);
                         }
 
                         float lum_neighbor = neighbor.x * 0.2126f + neighbor.y * 0.7152f + neighbor.z * 0.0722f;
