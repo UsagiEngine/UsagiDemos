@@ -295,6 +295,7 @@ int WINAPI WinMain(
 
     RT::ServiceScene scene;
     SetupCornellBox(scene);
+    scene.build_bvh(); // Shio: Initial BVH build.
     services.register_service(&scene);
 
     RT::ServiceRayQueue ray_queue;

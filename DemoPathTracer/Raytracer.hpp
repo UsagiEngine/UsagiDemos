@@ -337,6 +337,44 @@ struct Box
 // Components
 // -----------------------------------------------------------------------------
 
+/*
+ * Shio: AABB structure to accelerate ray intersections using a BVH.
+ */
+struct AABB {
+    Vector3f min = { 1e30f, 1e30f, 1e30f };
+    Vector3f max = { -1e30f, -1e30f, -1e30f };
+
+    void expand(const Vector3f & p) {
+        min.x = std::min(min.x, p.x);
+        min.y = std::min(min.y, p.y);
+        min.z = std::min(min.z, p.z);
+        max.x = std::max(max.x, p.x);
+        max.y = std::max(max.y, p.y);
+        max.z = std::max(max.z, p.z);
+    }
+
+    void expand(const AABB & b) {
+        expand(b.min);
+        expand(b.max);
+    }
+
+    Vector3f center() const { return (min + max) * 0.5f; }
+
+    bool intersect(const Vector3f & o, const Vector3f & inv_d, float t_min, float t_max) const {
+        float t0 = -1e30f;
+        float t1 = 1e30f;
+        for(int i = 0; i < 3; ++i) {
+            float tNear = (min[i] - o[i]) * inv_d[i];
+            float tFar  = (max[i] - o[i]) * inv_d[i];
+            if(inv_d[i] < 0.0f) std::swap(tNear, tFar);
+            t0 = std::max(t0, tNear);
+            t1 = std::min(t1, tFar);
+            if(t0 > t1) return false;
+        }
+        return (t0 <= t_max && t1 >= t_min);
+    }
+};
+
 struct ComponentRay
 {
     Vector3f origin;
@@ -652,6 +690,96 @@ struct ServiceScene
     Vector3f              sun_dir = {0, 1, 0};
     Vector3f              moon_dir = {0, -1, 0};
 
+    // Shio: BVH data structures
+    struct PrimRef {
+        int type; // 0: sphere, 1: box
+        int index;
+        AABB bounds;
+    };
+
+    struct BVHNode {
+        AABB bounds;
+        int left_child = -1;
+        int right_child = -1;
+        int first_prim = -1;
+        int prim_count = 0;
+        
+        bool is_leaf() const { return prim_count > 0; }
+    };
+
+    std::vector<PrimRef> bvh_prims;
+    std::vector<BVHNode> bvh_nodes;
+
+    // Shio: Build BVH from scratch using a simple median split over longest axis.
+    void build_bvh() {
+        bvh_prims.clear();
+        for (int i = 0; i < spheres.size(); ++i) {
+            AABB b;
+            b.expand(spheres[i].center - Vector3f{spheres[i].radius, spheres[i].radius, spheres[i].radius});
+            b.expand(spheres[i].center + Vector3f{spheres[i].radius, spheres[i].radius, spheres[i].radius});
+            bvh_prims.push_back({0, i, b});
+        }
+        for (int i = 0; i < boxes.size(); ++i) {
+            AABB b;
+            b.expand(boxes[i].min);
+            b.expand(boxes[i].max);
+            bvh_prims.push_back({1, i, b});
+        }
+        
+        bvh_nodes.clear();
+        if (bvh_prims.empty()) return;
+
+        bvh_nodes.emplace_back();
+        subdivide_bvh(0, 0, bvh_prims.size());
+    }
+
+    void subdivide_bvh(int node_idx, int first, int count) {
+        auto& node = bvh_nodes[node_idx];
+        node.first_prim = first;
+        node.prim_count = count;
+        
+        for (int i = 0; i < count; ++i) {
+            node.bounds.expand(bvh_prims[first + i].bounds);
+        }
+        
+        if (count <= 4) return; // Leaf threshold
+        
+        Vector3f extent = node.bounds.max - node.bounds.min;
+        int axis = 0;
+        if (extent.y > extent.x && extent.y > extent.z) axis = 1;
+        else if (extent.z > extent.x && extent.z > extent.y) axis = 2;
+        
+        float split_pos = node.bounds.min[axis] + extent[axis] * 0.5f;
+        
+        int i = first;
+        int j = first + count - 1;
+        while (i <= j) {
+            if (bvh_prims[i].bounds.center()[axis] < split_pos) {
+                i++;
+            } else {
+                std::swap(bvh_prims[i], bvh_prims[j]);
+                j--;
+            }
+        }
+        
+        int left_count = i - first;
+        if (left_count == 0 || left_count == count) {
+            left_count = count / 2;
+        }
+        
+        int left_child_idx = bvh_nodes.size();
+        bvh_nodes.emplace_back();
+        int right_child_idx = bvh_nodes.size();
+        bvh_nodes.emplace_back();
+        
+        bvh_nodes[node_idx].left_child = left_child_idx;
+        bvh_nodes[node_idx].right_child = right_child_idx;
+        bvh_nodes[node_idx].prim_count = 0; // Internal node
+        
+        subdivide_bvh(left_child_idx, first, left_count);
+        subdivide_bvh(right_child_idx, first + left_count, count - left_count);
+    }
+
     Color3f evaluate_emission(const Material& mat, const Vector3f& p, const Vector3f& center) const {
         if (!mat.is_moon) return mat.emission;
         
@@ -764,35 +892,60 @@ struct ServiceScene
     }
 
     std::optional<HitRecord> intersect(
-        const Vector3f & o, const Vector3f & d, float t_max)
+        const Vector3f & o, const Vector3f & d, float t_max) const
     {
+        if (bvh_nodes.empty()) return std::nullopt;
+
+        Vector3f inv_d = {
+            d.x == 0.0f ? 1e30f : 1.0f / d.x,
+            d.y == 0.0f ? 1e30f : 1.0f / d.y,
+            d.z == 0.0f ? 1e30f : 1.0f / d.z
+        };
+
         HitRecord rec;
-        rec.t             = t_max;
+        rec.t = t_max;
         bool hit_anything = false;
 
-        for(const auto & s : spheres)
-        {
-            if(auto t = s.intersect(o, d, 0.001f, rec.t))
-            {
-                rec.t              = *t;
-                rec.point          = o + d * rec.t;
-                rec.normal         = (rec.point - s.center).normalize(); // STRICTLY OUTWARD
-                rec.material_index = s.material_index;
-                rec.obj_center     = s.center;
-                hit_anything       = true;
-            }
-        }
+        int stack[64];
+        int stack_ptr = 0;
+        stack[stack_ptr++] = 0;
 
-        for(const auto & b : boxes)
-        {
-            if(auto t = b.intersect(o, d, 0.001f, rec.t))
-            {
-                rec.t              = *t;
-                rec.point          = o + d * rec.t;
-                rec.normal         = b.get_normal(rec.point); // STRICTLY OUTWARD
-                rec.material_index = b.material_index;
-                rec.obj_center     = b.min + (b.max - b.min) * 0.5f;
-                hit_anything       = true;
+        while (stack_ptr > 0) {
+            int node_idx = stack[--stack_ptr];
+            const auto& node = bvh_nodes[node_idx];
+
+            if (!node.bounds.intersect(o, inv_d, 0.001f, rec.t)) {
+                continue;
+            }
+
+            if (node.is_leaf()) {
+                for (int i = 0; i < node.prim_count; ++i) {
+                    const auto& prim = bvh_prims[node.first_prim + i];
+                    if (prim.type == 0) {
+                        const auto& s = spheres[prim.index];
+                        if (auto t = s.intersect(o, d, 0.001f, rec.t)) {
+                            rec.t              = *t;
+                            rec.point          = o + d * rec.t;
+                            rec.normal         = (rec.point - s.center).normalize(); // STRICTLY OUTWARD
+                            rec.material_index = s.material_index;
+                            rec.obj_center     = s.center;
+                            hit_anything       = true;
+                        }
+                    } else {
+                        const auto& b = boxes[prim.index];
+                        if (auto t = b.intersect(o, d, 0.001f, rec.t)) {
+                            rec.t              = *t;
+                            rec.point          = o + d * rec.t;
+                            rec.normal         = b.get_normal(rec.point); // STRICTLY OUTWARD
+                            rec.material_index = b.material_index;
+                            rec.obj_center     = b.min + (b.max - b.min) * 0.5f;
+                            hit_anything       = true;
+                        }
+                    }
+                }
+            } else {
+                stack[stack_ptr++] = node.right_child;
+                stack[stack_ptr++] = node.left_child;
             }
         }
 
@@ -1658,6 +1811,8 @@ struct SystemPathTracingCoordinator
                     scene.materials[scene.spheres[1].material_index].emission = { 0.0f, 0.0f, 0.0f };
                 }
             }
+
+            scene.build_bvh(); // Shio: Rebuild BVH as dynamic objects have moved!
 
             SystemGenerateRays sys_gen;
             sys_gen.update(entities, services);
