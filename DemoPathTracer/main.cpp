@@ -307,28 +307,32 @@ int WINAPI WinMain(
                 }
             }
         } else if (l_held) {
-            // Left Click Only: Drag along the ground plane (XZ plane relative to look direction)
+            // Left Click Only: UE Style (Mouse X = Yaw, Mouse Y = Move Forward/Backward)
             POINT current_mouse;
             GetCursorPos(&current_mouse);
             if (first_mouse) {
                 last_mouse_pos = current_mouse;
                 first_mouse = false;
             } else {
-                float dx = (current_mouse.x - last_mouse_pos.x) * 0.05f;
+                float dx = (current_mouse.x - last_mouse_pos.x) * 0.005f;
                 float dy = (current_mouse.y - last_mouse_pos.y) * 0.05f;
                 
                 if (dx != 0.0f || dy != 0.0f) {
-                    // Forward vector projected onto the XZ ground plane
+                    // X movement turns the camera (Yaw)
+                    camera.yaw += dx; 
+                    
+                    // Y movement pushes camera along the flat ground vector
                     RT::Vector3f flat_fwd = camera.forward();
                     flat_fwd.y = 0.0f;
                     if (flat_fwd.length_squared() > 0.0001f) {
                         flat_fwd = flat_fwd.normalize();
                     } else {
-                        flat_fwd = {0, 0, 1}; // Fallback if looking straight down/up
+                        flat_fwd = {0, 0, 1};
                     }
                     
-                    camera.position += camera.right() * dx; // standard X drag
-                    camera.position += flat_fwd * -dy; // standard forward drag (mouse up = negative dy = positive forward)
+                    // Dragging mouse down (positive dy) moves backward, up moves forward
+                    camera.position += flat_fwd * -dy;
+                    
                     moved = true;
                     SetCursorPos(last_mouse_pos.x, last_mouse_pos.y);
                 }
