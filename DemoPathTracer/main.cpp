@@ -83,11 +83,11 @@ void SetupCornellBox(RT::ServiceScene & scene)
         { 0.8f, 0.85f, 0.88f },
         { 0, 0, 0 },
         0.02f });
-    // 5: Translucent (Glass)
+    // 5: Translucent (Pale Purple Jelly SSS)
     scene.materials.push_back({ MaterialType::Translucent,
-        { 1.0f, 1.0f, 1.0f },
+        { 0.95f, 0.85f, 0.98f }, // Very pale, bright lilac/purple
         { 0, 0, 0 },
-        0.0f, 1.5f });
+        0.1f, 1.3f, false, 0.3f }); // Lower density to make it significantly more translucent
 
     // Cornell Box Walls (approximated with large boxes or planes, using Boxes
     // here)
@@ -265,8 +265,30 @@ int WINAPI WinMain(
 
         bool moved = false;
 
-        // Unreal Editor Style Mouse Look (Hold Right Click)
-        if (GetAsyncKeyState(VK_RBUTTON) & 0x8000) {
+        bool r_held = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+        bool l_held = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+
+        // Unreal Editor Style Mouse Input
+        if (l_held && r_held) {
+            // Both L and R: Pan vertically (World Y) and horizontally (Camera Right)
+            POINT current_mouse;
+            GetCursorPos(&current_mouse);
+            if (first_mouse) {
+                last_mouse_pos = current_mouse;
+                first_mouse = false;
+            } else {
+                float dx = (current_mouse.x - last_mouse_pos.x) * 0.05f;
+                float dy = (current_mouse.y - last_mouse_pos.y) * 0.05f;
+                
+                if (dx != 0.0f || dy != 0.0f) {
+                    camera.position += camera.right() * dx; // standard X drag
+                    camera.position.y += -dy; // standard Y drag (mouse up = negative dy = positive world Y)
+                    moved = true;
+                    SetCursorPos(last_mouse_pos.x, last_mouse_pos.y);
+                }
+            }
+        } else if (r_held) {
+            // Right Click Only: Mouse Look (FPS style)
             POINT current_mouse;
             GetCursorPos(&current_mouse);
             if (first_mouse) {
@@ -280,6 +302,33 @@ int WINAPI WinMain(
                     camera.yaw += dx; // Positive dx means looking right (+X)
                     camera.pitch += dy;
                     camera.pitch = std::clamp(camera.pitch, -1.5f, 1.5f); // Prevent gimbal lock loops
+                    moved = true;
+                    SetCursorPos(last_mouse_pos.x, last_mouse_pos.y);
+                }
+            }
+        } else if (l_held) {
+            // Left Click Only: Drag along the ground plane (XZ plane relative to look direction)
+            POINT current_mouse;
+            GetCursorPos(&current_mouse);
+            if (first_mouse) {
+                last_mouse_pos = current_mouse;
+                first_mouse = false;
+            } else {
+                float dx = (current_mouse.x - last_mouse_pos.x) * 0.05f;
+                float dy = (current_mouse.y - last_mouse_pos.y) * 0.05f;
+                
+                if (dx != 0.0f || dy != 0.0f) {
+                    // Forward vector projected onto the XZ ground plane
+                    RT::Vector3f flat_fwd = camera.forward();
+                    flat_fwd.y = 0.0f;
+                    if (flat_fwd.length_squared() > 0.0001f) {
+                        flat_fwd = flat_fwd.normalize();
+                    } else {
+                        flat_fwd = {0, 0, 1}; // Fallback if looking straight down/up
+                    }
+                    
+                    camera.position += camera.right() * dx; // standard X drag
+                    camera.position += flat_fwd * -dy; // standard forward drag (mouse up = negative dy = positive forward)
                     moved = true;
                     SetCursorPos(last_mouse_pos.x, last_mouse_pos.y);
                 }

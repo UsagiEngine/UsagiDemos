@@ -170,6 +170,7 @@ struct Material
     float        roughness; // For Metal / Translucent
     float        ior;       // Index of Refraction for Translucent
     bool         is_moon = false;
+    float        density = 0.0f; // Volumetric density for Translucent SSS
 };
 
 struct HitRecord
@@ -237,7 +238,8 @@ struct Box
     std::optional<float> intersect(
         const Vector3f & o, const Vector3f & d, float t_min, float t_max) const
     {
-        float t0 = t_min, t1 = t_max;
+        float t0 = -100000.0f;
+        float t1 = 100000.0f;
 
         for(int i = 0; i < 3; ++i)
         {
@@ -250,26 +252,24 @@ struct Box
             if(t1 <= t0) return std::nullopt;
         }
         
-        // Shio: To support glass refraction, we MUST return the exit hit if the ray originates
-        // INSIDE the box (i.e. t0 is negative, but t1 is positive).
-        if (t0 < t_min) {
-            if (t1 < t_min || t1 > t_max) return std::nullopt;
-            return t1;
-        }
+        // Shio: Now correctly returns the exit hit (t1) if the ray starts inside (t0 < t_min)!
+        if (t0 >= t_min && t0 <= t_max) return t0;
+        if (t1 >= t_min && t1 <= t_max) return t1;
         
-        return t0;
+        return std::nullopt;
     }
 
     Normal3f get_normal(const Vector3f & p) const
     {
-        const float epsilon = 0.0001f;
-        if(std::abs(p.x - min.x) < epsilon) return { -1, 0, 0 };
-        if(std::abs(p.x - max.x) < epsilon) return { 1, 0, 0 };
-        if(std::abs(p.y - min.y) < epsilon) return { 0, -1, 0 };
-        if(std::abs(p.y - max.y) < epsilon) return { 0, 1, 0 };
-        if(std::abs(p.z - min.z) < epsilon) return { 0, 0, -1 };
-        if(std::abs(p.z - max.z) < epsilon) return { 0, 0, 1 };
-        return { 0, 1, 0 };
+        // Robust normal calculation immune to floating point corner epsilons
+        Vector3f c = (min + max) * 0.5f;
+        Vector3f local_p = p - c;
+        Vector3f extents = (max - min) * 0.5f;
+        Vector3f n = { local_p.x / extents.x, local_p.y / extents.y, local_p.z / extents.z };
+        Vector3f abs_n = { std::abs(n.x), std::abs(n.y), std::abs(n.z) };
+        if (abs_n.x >= abs_n.y && abs_n.x >= abs_n.z) return { n.x > 0.0f ? 1.0f : -1.0f, 0.0f, 0.0f };
+        if (abs_n.y >= abs_n.x && abs_n.y >= abs_n.z) return { 0.0f, n.y > 0.0f ? 1.0f : -1.0f, 0.0f };
+        return { 0.0f, 0.0f, n.z > 0.0f ? 1.0f : -1.0f };
     }
 
     void sample_surface(SamplerPCG32& rng, Vector3f& p, Normal3f& n, float& pdf) const
@@ -1055,6 +1055,15 @@ struct SystemEvaluateTranslucent
                     cpaths[id].vertices[cpaths[id].count++] = {hit.point, hit.normal, state.throughput, mat.albedo, true};
                 } else if (!is_cam && lpaths[id].count < MAX_PATH_DEPTH) {
                     lpaths[id].vertices[lpaths[id].count++] = {hit.point, hit.normal, state.throughput, mat.albedo, true};
+                }
+
+                if (!hit.front_face) {
+                    // Shio: Beer's Law (Volumetric Absorption for Jelly/SSS)
+                    float dist = hit.t;
+                    Vector3f absorption = { 1.0f - mat.albedo.x, 1.0f - mat.albedo.y, 1.0f - mat.albedo.z };
+                    state.throughput.x *= std::exp(-absorption.x * dist * mat.density);
+                    state.throughput.y *= std::exp(-absorption.y * dist * mat.density);
+                    state.throughput.z *= std::exp(-absorption.z * dist * mat.density);
                 }
 
                 // Determine if we are entering or exiting the medium using explicit front_face flag
