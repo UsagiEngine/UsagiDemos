@@ -406,6 +406,10 @@ struct ServiceScheduler
 struct ServiceRenderState
 {
     int pass = 0; // 0: InitCam, 1: BounceCam, 2: InitLight, 3: BounceLight, 4: Connect
+    int ray_budget = 800 * 600; // initialize to max
+    uint32_t current_pixel_offset = 0;
+    uint32_t last_pixel_offset = 0;
+    std::vector<uint32_t> active_pixels;
 };
 
 struct ServiceRayQueue
@@ -469,6 +473,7 @@ struct ServiceFilm
     float filter_radius = 2.0f; // Mitchell filter radius
     float B = 1.0f / 3.0f;
     float C = 1.0f / 3.0f;
+    float sample_weight_multiplier = 1.0f;
 
     void init(int w, int h, float rx = 2.0f, float ry = 2.0f)
     {
@@ -537,7 +542,7 @@ struct ServiceFilm
             for (int x = x0; x <= x1; ++x) {
                 float dx = px - 0.5f - x;
                 float dy = py - 0.5f - y;
-                float weight = evaluate_filter(dx, dy);
+                float weight = evaluate_filter(dx, dy) * sample_weight_multiplier; // Shio: Energy conservation for sparse rendering
                 if (weight != 0.0f) {
                     int idx = y * width + x;
                     if (is_direct) {
@@ -563,6 +568,15 @@ struct ServiceFilm
                 while(!target.compare_exchange_weak(old, old * factor, std::memory_order_relaxed));
             };
             
+            // Shio: Fast decay for direct buffer preventing ghosting during sparse-updates, 
+            // while indirect gets the standard soft decay.
+            double direct_decay = (decay_factor == 1.0) ? 1.0 : (decay_factor == 0.0 ? 0.0 : decay_factor * 0.1); 
+            
+            atomic_scale(p.direct_r, direct_decay);
+            atomic_scale(p.direct_g, direct_decay);
+            atomic_scale(p.direct_b, direct_decay);
+            atomic_scale(p.direct_w, direct_decay);
+
             atomic_scale(p.indirect_r, decay_factor);
             atomic_scale(p.indirect_g, decay_factor);
             atomic_scale(p.indirect_b, decay_factor);
@@ -854,16 +868,29 @@ struct SystemGenerateRays
         auto & scene     = services.template get<ServiceScene>();
         auto & camera    = services.template get<ServiceCamera>();
 
-        if (state_svc.pass == 0) canvas.frame_count++;
+        size_t total_pixels = entities.size();
+        int actual_count = std::min((int)total_pixels, std::max(1000, state_svc.ray_budget));
+
+        if (state_svc.pass == 0) {
+            canvas.frame_count++;
+            state_svc.last_pixel_offset = state_svc.current_pixel_offset;
+            // 1000003u is a prime number to guarantee uniformly traversing all pixels across frames
+            state_svc.current_pixel_offset = (state_svc.current_pixel_offset + actual_count * 1000003u) % total_pixels;
+            
+            state_svc.active_pixels.resize(actual_count);
+            for(int i = 0; i < actual_count; ++i) {
+                 state_svc.active_pixels[i] = (state_svc.last_pixel_offset + i * 1000003u) % total_pixels;
+            }
+        }
+
+        ray_queue.active_rays = state_svc.active_pixels;
+        size_t count = state_svc.active_pixels.size();
 
         Vector3f cam_pos      = camera.position;
         Vector3f cam_fwd      = camera.forward();
         Vector3f cam_right    = camera.right();
         Vector3f cam_up       = camera.up();
         float    aspect_ratio = static_cast<float>(canvas.width) / static_cast<float>(canvas.height);
-
-        size_t count = entities.size();
-        ray_queue.active_rays.resize(count);
 
         auto pixels = entities.template get_array<ComponentPixel>();
         auto rays   = entities.template get_array<ComponentRay>();
@@ -876,11 +903,10 @@ struct SystemGenerateRays
         scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
             for(size_t i = start; i < end; ++i)
             {
-                ray_queue.active_rays[i] = static_cast<uint32_t>(i);
-
-                auto & pixel = pixels[i];
-                auto & ray   = rays[i];
-                auto & state = states[i];
+                uint32_t entity_idx = state_svc.active_pixels[i];
+                auto & pixel = pixels[entity_idx];
+                auto & ray   = rays[entity_idx];
+                auto & state = states[entity_idx];
 
                 // Initialize RNG once per pixel
                 if(state.rng.inc == 0)
@@ -920,13 +946,13 @@ struct SystemGenerateRays
                     ray.direction = (cam_fwd + cam_right * px + cam_up * py).normalize();
                     ray.t_max     = 1000.0f;
 
-                    cpaths[i].count = 0;
-                    cpaths[i].direct_emission = {0,0,0};
+                    cpaths[entity_idx].count = 0;
+                    cpaths[entity_idx].direct_emission = {0,0,0};
 
                     // Note: In BDPT, camera is theoretically vertex 0.
                     // We only record surface hits for now.
                 } else {
-                    lpaths[i].count = 0;
+                    lpaths[entity_idx].count = 0;
                     Vector3f p; Normal3f n; Color3f e; float pdf;
                     if (scene.sample_light(state.rng, p, n, e, pdf)) {
                         state.throughput = e * (1.0f / pdf);
@@ -935,8 +961,8 @@ struct SystemGenerateRays
                         
                         // First light vertex is the point on the light source.
                         // Setting albedo to PI ensures the 1/PI lambertian factor correctly cancels when connecting directly.
-                        lpaths[i].vertices[0] = {p, n, state.throughput, {PI,PI,PI}, false};
-                        lpaths[i].count = 1;
+                        lpaths[entity_idx].vertices[0] = {p, n, state.throughput, {PI,PI,PI}, false};
+                        lpaths[entity_idx].count = 1;
                         
                         ray.origin = p + n * 0.001f;
                         ray.direction = dir.normalize();
@@ -1413,7 +1439,7 @@ struct SystemConnectPaths
         auto & scheduler = services.template get<ServiceScheduler>();
         auto & scene     = services.template get<ServiceScene>();
 
-        size_t count = entities.size();
+        size_t count = state_svc.active_pixels.size();
         auto cpaths = entities.template get_array<ComponentCameraPath>();
         auto lpaths = entities.template get_array<ComponentLightPath>();
         auto states = entities.template get_array<ComponentPathState>();
@@ -1421,9 +1447,10 @@ struct SystemConnectPaths
         scheduler.host->parallel_for(count, 4096, [&](size_t start, size_t end) {
             for(size_t i = start; i < end; ++i)
             {
-                auto & cpath = cpaths[i];
-                auto & lpath = lpaths[i];
-                auto & state = states[i];
+                uint32_t entity_idx = state_svc.active_pixels[i];
+                auto & cpath = cpaths[entity_idx];
+                auto & lpath = lpaths[entity_idx];
+                auto & state = states[entity_idx];
 
                 float light_area = scene.get_light_area();
                 Color3f indirect_L = {0,0,0};
@@ -1516,7 +1543,6 @@ struct SystemPathTracingCoordinator
                 film.apply_ema_decay(0.0);
                 canvas.frame_count = 0;
             } else {
-                film.clear_direct();
                 if (time_svc.is_paused) {
                     // Infinite accumulation (decay = 1.0) merges all frames perfectly when paused and completely still
                     film.apply_ema_decay(1.0);
@@ -1524,6 +1550,10 @@ struct SystemPathTracingCoordinator
                     film.apply_ema_decay(0.35); // 0.35 gives ~1 frame of effective memory. Shadows move almost perfectly real-time now!
                 }
             }
+            
+            // Energy compensation for dynamic sparse rendering scaling!
+            float fraction = (float)state_svc.ray_budget / (canvas.width * canvas.height);
+            film.sample_weight_multiplier = 1.0f / std::max(0.001f, fraction);
             
             // Sun orbits in YZ plane. Z > 0 is out the back wall.
             scene.sun_dir = Vector3f{ 0.0f, std::cos(time), std::sin(time) }.normalize();

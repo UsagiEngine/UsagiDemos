@@ -91,7 +91,7 @@ void SetupCornellBox(RT::ServiceScene & scene)
 
     // 6: The Sun (Massive light sphere far away)
     scene.materials.push_back({ MaterialType::Light, { 1.0f, 1.0f, 1.0f }, { 15.0f, 15.0f, 15.0f }, 0.0f, 1.0f, false });
-    
+
     // 7: The Moon (Textured secondary light sphere directly opposed to the Sun)
     scene.materials.push_back({ MaterialType::Light, { 1.0f, 1.0f, 1.0f }, { 2.0f, 2.2f, 2.5f }, 0.0f, 1.0f, true });
 
@@ -154,7 +154,7 @@ void SetupCornellBox(RT::ServiceScene & scene)
     };
 
     // Massive Underground Base to catch escaping rays efficiently without 1000s of dirt blocks
-    scene.boxes.push_back({ { -100.0f, floor_y - 10.0f, -100.0f }, { 100.0f, floor_y - 3.0f, 100.0f }, 9 }); 
+    scene.boxes.push_back({ { -100.0f, floor_y - 10.0f, -100.0f }, { 100.0f, floor_y - 3.0f, 100.0f }, 9 });
 
     for (int x = -15; x <= 15; ++x) {
         for (int z = -15; z <= 25; ++z) {
@@ -162,7 +162,7 @@ void SetupCornellBox(RT::ServiceScene & scene)
             if (x >= -6 && x <= 6 && z >= -6 && z <= 6) continue;
 
             int h = get_height(x, z);
-            
+
             if (h < 0) {
                 // Frozen Lake
                 bool is_hole = (std::sin(x * 3.14f) * std::cos(z * 2.71f)) > 0.6f;
@@ -178,7 +178,7 @@ void SetupCornellBox(RT::ServiceScene & scene)
                 } else {
                     add_block(x, h, z, 8);  // Grassy lowlands
                 }
-                
+
                 // Add exposed cliff faces (only down to neighbor minimum to save polygons)
                 int min_neighbor = std::min({get_height(x-1, z), get_height(x+1, z), get_height(x, z-1), get_height(x, z+1), h});
                 for (int y = std::max(-2, min_neighbor); y < h; ++y) {
@@ -307,191 +307,193 @@ int WINAPI WinMain(
         }
     }
 
-    SystemPresentToGDI sys_present;
-
-    // Shio: Launch the render thread
-    std::thread render_thread([&]() {
-        Usagi::TaskGraphExecutionHost host(std::thread::hardware_concurrency() * 2);
-        scheduler.host = &host;
-
-        RT::SystemPathTracingCoordinator sys_coord;
-        RT::SystemRenderGDICanvas        sys_render;
-
-        host.register_system(sys_coord, primary_group, services);
-
-        host.build_graph();
-
-        while(g_RenderActive)
+        SystemPresentToGDI sys_present;
+    
+        // Shio: Launch the render thread
+        // This true game loop runs completely decoupled from the OS message pump,
+        // ensuring consistent input polling, time advancement, and rendering rates.
+        std::thread render_thread([&]() {
+            Usagi::TaskGraphExecutionHost host(std::thread::hardware_concurrency() * 2);
+            scheduler.host = &host;
+    
+            RT::SystemPathTracingCoordinator sys_coord;
+            RT::SystemRenderGDICanvas        sys_render;
+    
+            host.register_system(sys_coord, primary_group, services);
+            host.build_graph();
+    
+            auto last_time = std::chrono::high_resolution_clock::now();
+            bool first_mouse = true;
+            POINT last_mouse_pos = {0, 0};
+    
+            while(g_RenderActive)
+            {
+                // --- TIME AND INPUT UPDATE ---
+                auto current_time = std::chrono::high_resolution_clock::now();
+                float dt = std::chrono::duration<float>(current_time - last_time).count();
+                last_time = current_time;
+    
+                // --- Dynamic Ray Budget (Target ~60 FPS) ---
+                float target_dt = 1.0f / 60.0f;
+                if (dt > target_dt * 1.05f) {
+                    render_state.ray_budget = std::max(5000, int(render_state.ray_budget * 0.9f));
+                } else if (dt < target_dt * 0.95f) {
+                    render_state.ray_budget = std::min((int)PIXEL_COUNT, int(render_state.ray_budget * 1.05f));
+                }
+    
+                bool moved = false;
+                HWND foreground = GetForegroundWindow();
+                bool is_focused = (foreground == g_hWnd);
+    
+                bool r_held = is_focused && (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+                bool l_held = is_focused && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    
+                if (is_focused) {
+                    // Unreal Editor Style Mouse Input
+                    if (l_held && r_held) {
+                        // Both L and R: Pan vertically (World Y) and horizontally (Camera Right)
+                        POINT current_mouse;
+                        GetCursorPos(&current_mouse);
+                        if (first_mouse) {
+                            last_mouse_pos = current_mouse;
+                            first_mouse = false;
+                        } else {
+                            float dx = (current_mouse.x - last_mouse_pos.x) * 0.05f;
+                            float dy = (current_mouse.y - last_mouse_pos.y) * 0.05f;
+                            
+                            if (dx != 0.0f || dy != 0.0f) {
+                                camera.position += camera.right() * dx; // standard X drag
+                                camera.position.y += -dy; // standard Y drag
+                                moved = true;
+                                SetCursorPos(last_mouse_pos.x, last_mouse_pos.y);
+                            }
+                        }
+                    } else if (r_held) {
+                        // Right Click Only: Mouse Look (FPS style)
+                        POINT current_mouse;
+                        GetCursorPos(&current_mouse);
+                        if (first_mouse) {
+                            last_mouse_pos = current_mouse;
+                            first_mouse = false;
+                        } else {
+                            float dx = (current_mouse.x - last_mouse_pos.x) * 0.005f;
+                            float dy = (current_mouse.y - last_mouse_pos.y) * 0.005f;
+                            
+                            if (dx != 0.0f || dy != 0.0f) {
+                                camera.yaw += dx; // Positive dx means looking right (+X)
+                                camera.pitch += dy;
+                                camera.pitch = std::clamp(camera.pitch, -1.5f, 1.5f); // Prevent gimbal lock loops
+                                moved = true;
+                                SetCursorPos(last_mouse_pos.x, last_mouse_pos.y);
+                            }
+                        }
+                    } else if (l_held) {
+                        // Left Click Only: UE Style (Mouse X = Yaw, Mouse Y = Move Forward/Backward)
+                        POINT current_mouse;
+                        GetCursorPos(&current_mouse);
+                        if (first_mouse) {
+                            last_mouse_pos = current_mouse;
+                            first_mouse = false;
+                        } else {
+                            float dx = (current_mouse.x - last_mouse_pos.x) * 0.005f;
+                            float dy = (current_mouse.y - last_mouse_pos.y) * 0.05f;
+                            
+                            if (dx != 0.0f || dy != 0.0f) {
+                                camera.yaw += dx; 
+                                
+                                RT::Vector3f flat_fwd = camera.forward();
+                                flat_fwd.y = 0.0f;
+                                if (flat_fwd.length_squared() > 0.0001f) {
+                                    flat_fwd = flat_fwd.normalize();
+                                } else {
+                                    flat_fwd = {0, 0, 1};
+                                }
+                                
+                                camera.position += flat_fwd * -dy;
+                                moved = true;
+                                SetCursorPos(last_mouse_pos.x, last_mouse_pos.y);
+                            }
+                        }
+                    } else {
+                        first_mouse = true;
+                    }
+    
+                    // Colemak Keyboard movement
+                    float speed = 10.0f * dt;
+                    if (GetAsyncKeyState(VK_SHIFT) & 0x8000) speed *= 3.0f;
+    
+                    RT::Vector3f fwd = camera.forward();
+                    RT::Vector3f right = camera.right();
+                    RT::Vector3f delta = {0, 0, 0};
+    
+                    if (GetAsyncKeyState('W') & 0x8000) delta += fwd;
+                    if (GetAsyncKeyState('R') & 0x8000) delta -= fwd;
+                    if (GetAsyncKeyState('A') & 0x8000) delta -= right;
+                    if (GetAsyncKeyState('S') & 0x8000) delta += right;
+                    
+                    if (delta.x != 0 || delta.y != 0 || delta.z != 0) {
+                        camera.position += delta.normalize() * speed;
+                        moved = true;
+                    }
+                } else {
+                    first_mouse = true; // Prevents sudden jerks when regaining focus
+                }
+    
+                if (moved) camera.moved = true;
+    
+                // Shio: Time Control
+                static bool was_pause_held = false;
+                bool pause_held = is_focused && (GetAsyncKeyState(VK_OEM_1) & 0x8000) != 0;
+                if (pause_held && !was_pause_held) {
+                    time_svc.is_paused = !time_svc.is_paused;
+                }
+                was_pause_held = pause_held;
+    
+                float time_speed = 0.0f;
+                if (!time_svc.is_paused) {
+                    time_speed += 1.0f; // Base speed when running normally
+                }
+                if (is_focused && (GetAsyncKeyState('P') & 0x8000)) {
+                    time_speed += 1.5f; // Fast forward
+                }
+                if (is_focused && (GetAsyncKeyState('F') & 0x8000)) {
+                    time_speed -= 1.5f; // Rewind
+                }
+    
+                if (time_speed != 0.0f) {
+                    time_svc.current_time += dt * 0.3f * time_speed;
+                }
+    
+                // --- RENDER PIPELINE ---
+                // Execute the BDPT state machine which orchestrates the sub-passes
+                host.execute();
+                
+                // Render the splatted film explicitly after the BDPT cycle completes
+                sys_render.update(primary_group, services);
+                
+                // Present to Window asynchronously inside the worker thread to free up the OS message pump
+                sys_present.update(primary_group, services);
+            }
+        });
+    
+        // Main Message Loop (UI Thread only!)
+        MSG msg = { };
+        while(true)
         {
-            // Execute the BDPT state machine which orchestrates the sub-passes
-            host.execute();
-            
-            // Render the splatted film explicitly after the BDPT cycle completes
-            sys_render.update(primary_group, services);
-        }
-    });
-
-    // Main Message Loop
-    MSG msg = { };
-    auto last_time = std::chrono::high_resolution_clock::now();
-    bool first_mouse = true;
-    POINT last_mouse_pos = {0, 0};
-
-    while(true)
-    {
-        while(PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
-        {
-            if(msg.message == WM_QUIT)
+            // Shio: GetMessage blocks, allowing the UI thread to sleep peacefully at 0% CPU 
+            // while the background render_thread spins at maximum framerate!
+            if (GetMessage(&msg, nullptr, 0, 0))
+            {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+            else
             {
                 g_RenderActive = false;
                 render_thread.join();
                 return 0;
             }
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
         }
-
-        auto current_time = std::chrono::high_resolution_clock::now();
-        float dt = std::chrono::duration<float>(current_time - last_time).count();
-        last_time = current_time;
-
-        bool moved = false;
-
-        bool r_held = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
-        bool l_held = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-
-        // Unreal Editor Style Mouse Input
-        if (l_held && r_held) {
-            // Both L and R: Pan vertically (World Y) and horizontally (Camera Right)
-            POINT current_mouse;
-            GetCursorPos(&current_mouse);
-            if (first_mouse) {
-                last_mouse_pos = current_mouse;
-                first_mouse = false;
-            } else {
-                float dx = (current_mouse.x - last_mouse_pos.x) * 0.05f;
-                float dy = (current_mouse.y - last_mouse_pos.y) * 0.05f;
-                
-                if (dx != 0.0f || dy != 0.0f) {
-                    camera.position += camera.right() * dx; // standard X drag
-                    camera.position.y += -dy; // standard Y drag (mouse up = negative dy = positive world Y)
-                    moved = true;
-                    SetCursorPos(last_mouse_pos.x, last_mouse_pos.y);
-                }
-            }
-        } else if (r_held) {
-            // Right Click Only: Mouse Look (FPS style)
-            POINT current_mouse;
-            GetCursorPos(&current_mouse);
-            if (first_mouse) {
-                last_mouse_pos = current_mouse;
-                first_mouse = false;
-            } else {
-                float dx = (current_mouse.x - last_mouse_pos.x) * 0.005f;
-                float dy = (current_mouse.y - last_mouse_pos.y) * 0.005f;
-                
-                if (dx != 0.0f || dy != 0.0f) {
-                    camera.yaw += dx; // Positive dx means looking right (+X)
-                    camera.pitch += dy;
-                    camera.pitch = std::clamp(camera.pitch, -1.5f, 1.5f); // Prevent gimbal lock loops
-                    moved = true;
-                    SetCursorPos(last_mouse_pos.x, last_mouse_pos.y);
-                }
-            }
-        } else if (l_held) {
-            // Left Click Only: UE Style (Mouse X = Yaw, Mouse Y = Move Forward/Backward)
-            POINT current_mouse;
-            GetCursorPos(&current_mouse);
-            if (first_mouse) {
-                last_mouse_pos = current_mouse;
-                first_mouse = false;
-            } else {
-                float dx = (current_mouse.x - last_mouse_pos.x) * 0.005f;
-                float dy = (current_mouse.y - last_mouse_pos.y) * 0.05f;
-                
-                if (dx != 0.0f || dy != 0.0f) {
-                    // X movement turns the camera (Yaw)
-                    camera.yaw += dx; 
-                    
-                    // Y movement pushes camera along the flat ground vector
-                    RT::Vector3f flat_fwd = camera.forward();
-                    flat_fwd.y = 0.0f;
-                    if (flat_fwd.length_squared() > 0.0001f) {
-                        flat_fwd = flat_fwd.normalize();
-                    } else {
-                        flat_fwd = {0, 0, 1};
-                    }
-                    
-                    // Dragging mouse down (positive dy) moves backward, up moves forward
-                    camera.position += flat_fwd * -dy;
-                    
-                    moved = true;
-                    SetCursorPos(last_mouse_pos.x, last_mouse_pos.y);
-                }
-            }
-        } else {
-            first_mouse = true;
-        }
-
-        // Colemak (WARS physical) Keyboard movement
-        float speed = 10.0f * dt;
-        if (GetAsyncKeyState(VK_SHIFT) & 0x8000) speed *= 3.0f; // Sprint
-
-        RT::Vector3f fwd = camera.forward();
-        RT::Vector3f right = camera.right();
-        RT::Vector3f delta = {0, 0, 0};
-
-        if (GetAsyncKeyState('W') & 0x8000) delta += fwd;
-        if (GetAsyncKeyState('R') & 0x8000) delta -= fwd;
-        if (GetAsyncKeyState('A') & 0x8000) delta -= right;
-        if (GetAsyncKeyState('S') & 0x8000) delta += right;
-        
-        if (delta.x != 0 || delta.y != 0 || delta.z != 0) {
-            camera.position += delta.normalize() * speed;
-            moved = true;
-        }
-
-        if (moved) camera.moved = true;
-
-        // Shio: Time Control
-        // Physical P (Virtual Key VK_OEM_1 or ';' in Colemak layout) toggles pause
-        static bool was_pause_held = false;
-        bool pause_held = (GetAsyncKeyState(VK_OEM_1) & 0x8000) != 0;
-        if (pause_held && !was_pause_held) {
-            time_svc.is_paused = !time_svc.is_paused;
-        }
-        was_pause_held = pause_held;
-
-        // Physical R (Virtual Key 'P' in Colemak layout) unconditionally adds +1.5x time speed
-        // Physical E (Virtual Key 'F' in Colemak layout) unconditionally adds -1.5x time speed
-        float time_speed = 0.0f;
-        if (!time_svc.is_paused) {
-            time_speed += 1.0f; // Base speed when running normally
-        }
-        if (GetAsyncKeyState('P') & 0x8000) {
-            time_speed += 1.5f; // Fast forward
-        }
-        if (GetAsyncKeyState('F') & 0x8000) {
-            time_speed -= 1.5f; // Rewind
-        }
-
-        // Apply smooth time advancement
-        // 0.3f effectively matches the old 60fps * 0.005f pacing
-        if (time_speed != 0.0f) {
-            time_svc.current_time += dt * 0.3f * time_speed;
-        }
-
-        // Present to Window (Main Thread)
-        // We present as fast as the main thread can, or we could limit this.
-        // It reads from the buffer being written by the render thread.
-        // Tearing may occur, but UI stays responsive.
-        sys_present.update(primary_group, services);
-
-        // Yield slightly to prevent 100% CPU usage on the UI thread effectively
-        // busy-waiting for messages if the queue is empty.
-        // std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
     return 0;
 }
 
