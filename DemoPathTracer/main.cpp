@@ -236,7 +236,7 @@ int WINAPI WinMain(
         {
             // Execute the BDPT state machine which orchestrates the sub-passes
             host.execute();
-            
+
             // Render the splatted film explicitly after the BDPT cycle completes
             sys_render.update(primary_group, services);
         }
@@ -282,7 +282,7 @@ int WINAPI WinMain(
             } else {
                 float dx = (current_mouse.x - last_mouse_pos.x) * 0.05f;
                 float dy = (current_mouse.y - last_mouse_pos.y) * 0.05f;
-                
+
                 if (dx != 0.0f || dy != 0.0f) {
                     camera.position += camera.right() * dx; // standard X drag
                     camera.position.y += -dy; // standard Y drag (mouse up = negative dy = positive world Y)
@@ -300,7 +300,7 @@ int WINAPI WinMain(
             } else {
                 float dx = (current_mouse.x - last_mouse_pos.x) * 0.005f;
                 float dy = (current_mouse.y - last_mouse_pos.y) * 0.005f;
-                
+
                 if (dx != 0.0f || dy != 0.0f) {
                     camera.yaw += dx; // Positive dx means looking right (+X)
                     camera.pitch += dy;
@@ -319,11 +319,11 @@ int WINAPI WinMain(
             } else {
                 float dx = (current_mouse.x - last_mouse_pos.x) * 0.005f;
                 float dy = (current_mouse.y - last_mouse_pos.y) * 0.05f;
-                
+
                 if (dx != 0.0f || dy != 0.0f) {
                     // X movement turns the camera (Yaw)
-                    camera.yaw += dx; 
-                    
+                    camera.yaw += dx;
+
                     // Y movement pushes camera along the flat ground vector
                     RT::Vector3f flat_fwd = camera.forward();
                     flat_fwd.y = 0.0f;
@@ -332,10 +332,10 @@ int WINAPI WinMain(
                     } else {
                         flat_fwd = {0, 0, 1};
                     }
-                    
+
                     // Dragging mouse down (positive dy) moves backward, up moves forward
                     camera.position += flat_fwd * -dy;
-                    
+
                     moved = true;
                     SetCursorPos(last_mouse_pos.x, last_mouse_pos.y);
                 }
@@ -356,7 +356,7 @@ int WINAPI WinMain(
         if (GetAsyncKeyState('R') & 0x8000) delta -= fwd;
         if (GetAsyncKeyState('A') & 0x8000) delta -= right;
         if (GetAsyncKeyState('S') & 0x8000) delta += right;
-        
+
         if (delta.x != 0 || delta.y != 0 || delta.z != 0) {
             camera.position += delta.normalize() * speed;
             moved = true;

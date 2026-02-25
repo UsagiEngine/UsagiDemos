@@ -111,7 +111,42 @@ struct SamplerPCG32
 
     // Returns float in [0, 1)
     float next_float() { return (next_u32() >> 8) * (1.0f / 16777216.0f); }
+    
+    // Shio: Blue-noise / Low-Discrepancy wrapping
+    // Maps a uniform pixel sample index + bounce dimension to a uniquely stratified float
+    float next_1d(uint32_t sample_idx, uint32_t dimension) {
+        // Weyl sequence for low discrepancy 1D stratification combined with random pixel shift
+        float shift = next_float();
+        float s = (sample_idx * 0x0.9E3779B9p-32f) + (dimension * 0x0.B504F333p-32f); 
+        float result = s + shift;
+        return result - std::floor(result); // fract()
+    }
 };
+
+/*
+ * Shio: Generates well-distributed points using radical inverse (Halton).
+ * Replaces pure white-noise clustering with low-discrepancy sequences
+ * that visually converge far smoother.
+ */
+inline float radical_inverse(uint32_t bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10f; // / 0x100000000
+}
+
+inline float halton(uint32_t index, uint32_t base) {
+    float f = 1.0f;
+    float r = 0.0f;
+    while (index > 0) {
+        f = f / (float)base;
+        r = r + f * (float)(index % base);
+        index = index / base;
+    }
+    return r;
+}
 
 struct ONB {
     Vector3f u, v, w;
@@ -139,15 +174,22 @@ inline Vector3f cosine_sample_hemisphere(float u1, float u2) {
  * Shio: Generates a random point inside the unit sphere.
  * Used for diffuse scattering.
  */
-inline Vector3f random_in_unit_sphere(SamplerPCG32 & rng)
+inline Vector3f random_in_unit_sphere(SamplerPCG32 & rng, uint32_t sample_idx, uint32_t dimension)
 {
-    while(true)
-    {
-        Vector3f p = { rng.next_float() * 2.0f - 1.0f,
-            rng.next_float() * 2.0f - 1.0f,
-            rng.next_float() * 2.0f - 1.0f };
-        if(p.length_squared() < 1.0f) return p;
-    }
+    // Shio: Efficient uniform mapping from unit square to sphere interior
+    // using low discrepancy floats
+    float u1 = rng.next_1d(sample_idx, dimension + 0);
+    float u2 = rng.next_1d(sample_idx, dimension + 1);
+    float u3 = rng.next_1d(sample_idx, dimension + 2);
+    
+    float z = 1.0f - 2.0f * u1;
+    float r = std::sqrt(std::max(0.0f, 1.0f - z * z));
+    float phi = 2.0f * PI * u2;
+    Vector3f n = { r * std::cos(phi), r * std::sin(phi), z };
+    
+    // Scale by cubic root to fill the sphere uniformly (not just shell)
+    float r3 = std::cbrt(u3);
+    return n * r3;
 }
 
 // -----------------------------------------------------------------------------
@@ -359,6 +401,7 @@ struct ComponentPathState
     bool         last_bounce_specular;
     float        sample_x;
     float        sample_y;
+    uint32_t     sample_index; // For low-discrepancy evaluation
 };
 
 // -----------------------------------------------------------------------------
@@ -855,7 +898,13 @@ struct SystemGenerateRays
                     // Shio: O(1) temporal seeding instead of looping. The frame count guarantees
                     // a unique temporal stream of stochastic samples over time.
                     state.rng.seed(pixel.y * canvas.width + pixel.x + 1, 1337 + canvas.frame_count.load());
+                    // Generate a random pixel-specific offset for the Halton sequence
+                    // to prevent structural grid patterns across neighboring pixels
+                    state.sample_index = state.rng.next_u32();
                 }
+
+                // Advance sample index to guarantee a unique sequence point each frame
+                uint32_t current_sample = state.sample_index + canvas.frame_count.load();
 
                 state.throughput = { 1.0f, 1.0f, 1.0f };
                 state.radiance   = { 0.0f, 0.0f, 0.0f };
@@ -864,9 +913,9 @@ struct SystemGenerateRays
                 state.last_bounce_specular = true;
 
                 if (is_cam) {
-                    // Jitter for anti-aliasing
-                    float j_x = state.rng.next_float();
-                    float j_y = state.rng.next_float();
+                    // Jitter for anti-aliasing (Base-2 / Base-3 Radical Inverse)
+                    float j_x = radical_inverse(current_sample);
+                    float j_y = halton(current_sample, 3);
                     state.sample_x = pixel.x + j_x;
                     state.sample_y = pixel.y + j_y;
 
@@ -1095,7 +1144,8 @@ struct SystemEvaluateTranslucent
                 }
                 
                 if (mat.roughness > 0.0f) {
-                    scatter_dir = scatter_dir + random_in_unit_sphere(state.rng) * mat.roughness;
+                    uint32_t sample_idx = state.sample_index + state.rng.next_u32(); 
+                    scatter_dir = scatter_dir + random_in_unit_sphere(state.rng, sample_idx, state.depth * 3) * mat.roughness;
                 }
                 
                 scatter_dir = scatter_dir.normalize();
@@ -1171,7 +1221,12 @@ struct SystemEvaluateLambert
 
                 ONB onb;
                 onb.build_from_w(hit.normal);
-                Vector3f scatter_dir = onb.local(cosine_sample_hemisphere(state.rng.next_float(), state.rng.next_float()));
+                
+                uint32_t sample_idx = state.sample_index + state.rng.next_u32(); // Add some extra temporal shuffling
+                float u1 = state.rng.next_1d(sample_idx, state.depth * 2 + 0);
+                float u2 = state.rng.next_1d(sample_idx, state.depth * 2 + 1);
+                
+                Vector3f scatter_dir = onb.local(cosine_sample_hemisphere(u1, u2));
 
                 ray.origin    = hit.point + hit.normal * 0.001f;
                 ray.direction = scatter_dir.normalize();
@@ -1245,7 +1300,8 @@ struct SystemEvaluateMetal
                 Vector3f target = reflected;
                 
                 if(mat.roughness > 0.0f) {
-                    target = target + random_in_unit_sphere(state.rng) * mat.roughness;
+                    uint32_t sample_idx = state.sample_index + state.rng.next_u32(); 
+                    target = target + random_in_unit_sphere(state.rng, sample_idx, state.depth * 3) * mat.roughness;
                 }
 
                 if(target.dot(hit.normal) > 0.0f) {
