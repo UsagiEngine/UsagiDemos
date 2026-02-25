@@ -179,6 +179,12 @@ struct HitRecord
     Normal3f normal;
     int      material_index;
     Vector3f obj_center;
+    bool     front_face;
+    
+    inline void set_face_normal(const Vector3f& r_dir, const Normal3f& outward_normal) {
+        front_face = r_dir.dot(outward_normal) < 0.0f;
+        normal = front_face ? outward_normal : outward_normal * -1.0f;
+    }
 };
 
 struct Sphere
@@ -243,12 +249,19 @@ struct Box
             t1 = tFar < t1 ? tFar : t1;
             if(t1 <= t0) return std::nullopt;
         }
+        
+        // Shio: To support glass refraction, we MUST return the exit hit if the ray originates
+        // INSIDE the box (i.e. t0 is negative, but t1 is positive).
+        if (t0 < t_min) {
+            if (t1 < t_min || t1 > t_max) return std::nullopt;
+            return t1;
+        }
+        
         return t0;
     }
 
     Normal3f get_normal(const Vector3f & p) const
     {
-        // Determine which face we hit
         const float epsilon = 0.0001f;
         if(std::abs(p.x - min.x) < epsilon) return { -1, 0, 0 };
         if(std::abs(p.x - max.x) < epsilon) return { 1, 0, 0 };
@@ -654,7 +667,7 @@ struct ServiceScene
             {
                 rec.t              = *t;
                 rec.point          = o + d * rec.t;
-                rec.normal         = (rec.point - s.center).normalize();
+                rec.normal         = (rec.point - s.center).normalize(); // STRICTLY OUTWARD
                 rec.material_index = s.material_index;
                 rec.obj_center     = s.center;
                 hit_anything       = true;
@@ -667,7 +680,7 @@ struct ServiceScene
             {
                 rec.t              = *t;
                 rec.point          = o + d * rec.t;
-                rec.normal         = b.get_normal(rec.point);
+                rec.normal         = b.get_normal(rec.point); // STRICTLY OUTWARD
                 rec.material_index = b.material_index;
                 rec.obj_center     = b.min + (b.max - b.min) * 0.5f;
                 hit_anything       = true;
@@ -952,6 +965,10 @@ struct SystemIntersectRays
                 {
                     hit_c.did_hit = true;
                     hit_c.hit = *opt_hit;
+                    
+                    // Shio: Robust front_face resolution
+                    // The 'normal' field coming from primitives is strictly OUTWARD-pointing.
+                    hit_c.hit.set_face_normal(ray.direction, hit_c.hit.normal);
 
                     const auto & mat = scene.materials[opt_hit->material_index];
                     
@@ -1040,12 +1057,10 @@ struct SystemEvaluateTranslucent
                     lpaths[id].vertices[lpaths[id].count++] = {hit.point, hit.normal, state.throughput, mat.albedo, true};
                 }
 
-                // Determine if we are entering or exiting the medium
-                float ndotd = ray.direction.dot(hit.normal);
-                Normal3f outward_normal = ndotd > 0.0f ? -hit.normal : hit.normal;
-                float eta = ndotd > 0.0f ? mat.ior : (1.0f / mat.ior);
-                float cos_theta_i = std::min(-ndotd, 1.0f);
-                if (ndotd > 0.0f) cos_theta_i = ndotd; // Inside to outside
+                // Determine if we are entering or exiting the medium using explicit front_face flag
+                // hit.normal is guaranteed by SystemIntersectRays to point AGAINST ray.direction
+                float eta = hit.front_face ? (1.0f / mat.ior) : mat.ior;
+                float cos_theta_i = std::min(hit.normal.dot(ray.direction * -1.0f), 1.0f);
 
                 // Schlick's approximation for Fresnel reflectance
                 float r0 = (1.0f - eta) / (1.0f + eta);
@@ -1060,12 +1075,13 @@ struct SystemEvaluateTranslucent
 
                 Vector3f scatter_dir;
                 if (state.rng.next_float() < R) {
-                    // Reflect
-                    scatter_dir = ray.direction - hit.normal * 2.0f * ndotd;
+                    // Reflect (hit.normal is against ray, so standard reflection works)
+                    scatter_dir = ray.direction + hit.normal * 2.0f * cos_theta_i;
                 } else {
                     // Refract
                     float cos_theta_t = std::sqrt(1.0f - sin_theta_t_sq);
-                    scatter_dir = ray.direction * eta + outward_normal * (eta * cos_theta_i - cos_theta_t);
+                    // Since hit.normal is against ray, inward normal is -hit.normal
+                    scatter_dir = ray.direction * eta + hit.normal * (eta * cos_theta_i - cos_theta_t);
                 }
                 
                 if (mat.roughness > 0.0f) {
@@ -1074,8 +1090,10 @@ struct SystemEvaluateTranslucent
                 
                 scatter_dir = scatter_dir.normalize();
 
-                // Move origin along the normal relative to the direction of propagation 
-                // to prevent self-intersection. Bias slightly inward if refracting!
+                // Shio: Bias origin OUTWARD from the surface if reflecting, INWARD if refracting.
+                // Since hit.normal points against the incoming ray (OUTWARD from the surface we hit):
+                // If reflecting, scatter_dir is on the same side as hit.normal. dot > 0.
+                // If refracting, scatter_dir is on the opposite side. dot < 0.
                 float bias_dir = scatter_dir.dot(hit.normal) > 0.0f ? 1.0f : -1.0f;
                 ray.origin    = hit.point + hit.normal * (0.001f * bias_dir);
                 ray.direction = scatter_dir;
