@@ -96,18 +96,18 @@ void SetupCornellBox(RT::ServiceScene & scene)
     scene.materials.push_back({ MaterialType::Light, { 1.0f, 1.0f, 1.0f }, { 2.0f, 2.2f, 2.5f }, 0.0f, 1.0f, true });
 
     // --- Minecraft-style World Materials ---
-    // 8: Grass (Lambertian Green)
-    scene.materials.push_back({ MaterialType::Lambert, { 0.2f, 0.6f, 0.15f }, { 0, 0, 0 }, 0.0f });
+    // 8: Grass (Lambertian Vivid Green)
+    scene.materials.push_back({ MaterialType::Lambert, { 0.3f, 0.7f, 0.2f }, { 0, 0, 0 }, 0.0f });
     // 9: Dirt (Lambertian Brown)
-    scene.materials.push_back({ MaterialType::Lambert, { 0.35f, 0.25f, 0.15f }, { 0, 0, 0 }, 0.0f });
+    scene.materials.push_back({ MaterialType::Lambert, { 0.4f, 0.25f, 0.15f }, { 0, 0, 0 }, 0.0f });
     // 10: Wood Log (Lambertian Dark Brown)
     scene.materials.push_back({ MaterialType::Lambert, { 0.25f, 0.15f, 0.08f }, { 0, 0, 0 }, 0.0f });
     // 11: Leaves (Subsurface Translucent Green)
-    scene.materials.push_back({ MaterialType::Translucent, { 0.15f, 0.5f, 0.1f }, { 0, 0, 0 }, 0.4f, 1.1f, false, 1.5f });
-    // 12: Snow (Highly reflective rough Lambertian)
-    scene.materials.push_back({ MaterialType::Lambert, { 0.95f, 0.95f, 0.98f }, { 0, 0, 0 }, 0.0f });
-    // 13: Frozen Lake (Ice / Water, Translucent with slight blue tint)
-    scene.materials.push_back({ MaterialType::Translucent, { 0.8f, 0.9f, 0.95f }, { 0, 0, 0 }, 0.05f, 1.31f, false, 0.05f });
+    scene.materials.push_back({ MaterialType::Translucent, { 0.2f, 0.8f, 0.2f }, { 0, 0, 0 }, 0.3f, 1.1f, false, 0.5f });
+    // 12: Snow (Highly reflective rough Lambertian with slight blue tint)
+    scene.materials.push_back({ MaterialType::Lambert, { 0.9f, 0.95f, 1.0f }, { 0, 0, 0 }, 0.0f });
+    // 13: Frozen Lake (Highly glossy Ice)
+    scene.materials.push_back({ MaterialType::Translucent, { 0.7f, 0.85f, 0.95f }, { 0, 0, 0 }, 0.005f, 1.31f, false, 0.1f });
 
     // Cornell Box Walls (approximated with large boxes or planes, using Boxes here)
     float s = 10.0f; // Scale
@@ -129,49 +129,83 @@ void SetupCornellBox(RT::ServiceScene & scene)
     // Short box
     scene.boxes.push_back(
         { { -3.0f, -s, 2.0f }, { 0.0f, -s + 3.0f, 5.0f }, 0 });
-    // Tall box (Glass)
+    // Tall box (Jelly)
     scene.boxes.push_back(
         { { 2.0f, -s, -3.0f }, { 5.0f, -s + 6.0f, 0.0f }, 5 });
 
     // --- Minecraft World Generation ---
     float bs = 2.0f; // Block Size
     float floor_y = -s - 1.0f; // Align with bottom of Cornell Box
-    
-    // Large Ground Plane (Snowy field mixed with dirt)
-    scene.boxes.push_back({ { -100.0f, floor_y - 2.0f, -100.0f }, { 100.0f, floor_y, 100.0f }, 9 }); // Deep Dirt Base
-    scene.boxes.push_back({ { -100.0f, floor_y, -100.0f }, { 100.0f, floor_y + 0.5f, 100.0f }, 12 }); // Snow Blanket layer
-    
-    // Frozen Lake
-    scene.boxes.push_back({ { -40.0f, floor_y - 2.0f, 15.0f }, { 10.0f, floor_y + 0.1f, 60.0f }, 13 }); // Ice Block carving through snow
-    
-    // Grassy Island in the lake
-    scene.boxes.push_back({ { -20.0f, floor_y - 2.0f, 30.0f }, { -10.0f, floor_y + 1.0f, 40.0f }, 9 }); // Dirt
-    scene.boxes.push_back({ { -20.0f, floor_y + 1.0f, 30.0f }, { -10.0f, floor_y + 1.5f, 40.0f }, 8 }); // Grass Top
-    
-    // A Minecraft Tree 1 (On the Island)
-    float t1_x = -15.0f, t1_z = 35.0f;
-    for(int i=0; i<4; ++i) { // Trunk
-        scene.boxes.push_back({ { t1_x - 0.8f, floor_y + 1.5f + i*bs, t1_z - 0.8f }, { t1_x + 0.8f, floor_y + 1.5f + (i+1)*bs, t1_z + 0.8f }, 10 });
-    }
-    // Leaves (Translucent SSS)
-    scene.boxes.push_back({ { t1_x - 2.5f*bs, floor_y + 1.5f + 3*bs, t1_z - 2.5f*bs }, { t1_x + 2.5f*bs, floor_y + 1.5f + 5*bs, t1_z + 2.5f*bs }, 11 });
-    scene.boxes.push_back({ { t1_x - 1.5f*bs, floor_y + 1.5f + 5*bs, t1_z - 1.5f*bs }, { t1_x + 1.5f*bs, floor_y + 1.5f + 6*bs, t1_z + 1.5f*bs }, 11 });
 
-    // A Minecraft Tree 2 (Snowy Forest edge)
-    float t2_x = 25.0f, t2_z = 10.0f;
-    for(int i=0; i<5; ++i) { // Trunk
-        scene.boxes.push_back({ { t2_x - 0.8f, floor_y + 0.5f + i*bs, t2_z - 0.8f }, { t2_x + 0.8f, floor_y + 0.5f + (i+1)*bs, t2_z + 0.8f }, 10 });
-    }
-    // Leaves
-    scene.boxes.push_back({ { t2_x - 2.5f*bs, floor_y + 0.5f + 3*bs, t2_z - 2.5f*bs }, { t2_x + 2.5f*bs, floor_y + 0.5f + 5*bs, t2_z + 2.5f*bs }, 11 });
-    scene.boxes.push_back({ { t2_x - 1.5f*bs, floor_y + 0.5f + 5*bs, t2_z - 1.5f*bs }, { t2_x + 1.5f*bs, floor_y + 0.5f + 6*bs, t2_z + 1.5f*bs }, 11 });
-    // Snow caps on the tree
-    scene.boxes.push_back({ { t2_x - 1.4f*bs, floor_y + 0.5f + 6*bs, t2_z - 1.4f*bs }, { t2_x + 1.4f*bs, floor_y + 0.5f + 6.3f*bs, t2_z + 1.4f*bs }, 12 });
+    auto add_block = [&](float x, float y, float z, int mat_idx, float scale = 1.0f) {
+        float gap = bs * (1.0f - scale) * 0.5f;
+        scene.boxes.push_back({
+            { x * bs + gap, floor_y + y * bs + gap, z * bs + gap },
+            { (x + 1) * bs - gap, floor_y + (y + 1) * bs - gap, (z + 1) * bs - gap },
+            mat_idx
+        });
+    };
 
-    // Floating/Scattered Minecraft Blocks
-    scene.boxes.push_back({ { 12.0f, floor_y + 0.5f, -15.0f }, { 12.0f + bs, floor_y + 0.5f + bs, -15.0f + bs }, 10 }); // Log on ground
-    scene.boxes.push_back({ { -25.0f, floor_y + 0.5f, -5.0f }, { -25.0f + bs, floor_y + 0.5f + bs, -5.0f + bs }, 13 }); // Ice block
-    scene.boxes.push_back({ { -25.0f, floor_y + 0.5f + bs, -5.0f }, { -25.0f + bs, floor_y + 0.5f + 2*bs, -5.0f + bs }, 13 }); // Ice block stacked
+    auto get_height = [](int x, int z) {
+        float fx = x * 0.15f;
+        float fz = z * 0.15f;
+        float h = std::sin(fx) * std::cos(fz) * 3.0f + std::sin(fx * 2.5f + fz * 1.5f) * 1.0f;
+        return (int)std::floor(h);
+    };
+
+    // Massive Underground Base to catch escaping rays efficiently without 1000s of dirt blocks
+    scene.boxes.push_back({ { -100.0f, floor_y - 10.0f, -100.0f }, { 100.0f, floor_y - 3.0f, 100.0f }, 9 }); 
+
+    for (int x = -15; x <= 15; ++x) {
+        for (int z = -15; z <= 25; ++z) {
+            // Leave space for the Cornell Box
+            if (x >= -6 && x <= 6 && z >= -6 && z <= 6) continue;
+
+            int h = get_height(x, z);
+            
+            if (h < 0) {
+                // Frozen Lake
+                bool is_hole = (std::sin(x * 3.14f) * std::cos(z * 2.71f)) > 0.6f;
+                if (!is_hole) {
+                    add_block(x, -1, z, 13); // Ice Surface
+                } else {
+                    add_block(x, -2, z, 13); // Sunken Ice (Fracture/Hole)
+                }
+            } else {
+                // Land
+                if (h > 1) {
+                    add_block(x, h, z, 12); // Snow capped peaks
+                } else {
+                    add_block(x, h, z, 8);  // Grassy lowlands
+                }
+                
+                // Add exposed cliff faces (only down to neighbor minimum to save polygons)
+                int min_neighbor = std::min({get_height(x-1, z), get_height(x+1, z), get_height(x, z-1), get_height(x, z+1), h});
+                for (int y = std::max(-2, min_neighbor); y < h; ++y) {
+                    add_block(x, y, z, 9); // Dirt cliff
+                }
+
+                // Random Trees
+                if (h <= 1 && (std::abs(x * 73 + z * 37) % 45 == 0)) {
+                    int tree_h = 3 + (std::abs(x+z) % 3);
+                    // Trunk
+                    for (int ty = 1; ty <= tree_h; ++ty) {
+                        add_block(x, h + ty, z, 10, 0.8f);
+                    }
+                    // Leaves with physical gaps allowing light transmission!
+                    for (int lx = -2; lx <= 2; ++lx) {
+                        for (int ly = 0; ly <= 2; ++ly) {
+                            for (int lz = -2; lz <= 2; ++lz) {
+                                if (std::abs(lx) == 2 && std::abs(lz) == 2 && ly == 2) continue; // Round canopy corners
+                                if ((std::abs(lx * 11 + ly * 13 + lz * 17)) % 4 == 0) continue; // Procedural gaps for dappled light
+                                add_block(x + lx, h + tree_h - 1 + ly, z + lz, 11, 0.85f);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 int WINAPI WinMain(
