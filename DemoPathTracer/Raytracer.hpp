@@ -111,16 +111,6 @@ struct SamplerPCG32
 
     // Returns float in [0, 1)
     float next_float() { return (next_u32() >> 8) * (1.0f / 16777216.0f); }
-    
-    // Shio: Blue-noise / Low-Discrepancy wrapping
-    // Maps a uniform pixel sample index + bounce dimension to a uniquely stratified float
-    float next_1d(uint32_t sample_idx, uint32_t dimension) {
-        // Weyl sequence for low discrepancy 1D stratification combined with random pixel shift
-        float shift = next_float();
-        float s = (sample_idx * 0x0.9E3779B9p-32f) + (dimension * 0x0.B504F333p-32f); 
-        float result = s + shift;
-        return result - std::floor(result); // fract()
-    }
 };
 
 /*
@@ -174,13 +164,13 @@ inline Vector3f cosine_sample_hemisphere(float u1, float u2) {
  * Shio: Generates a random point inside the unit sphere.
  * Used for diffuse scattering.
  */
-inline Vector3f random_in_unit_sphere(SamplerPCG32 & rng, uint32_t sample_idx, uint32_t dimension)
+inline Vector3f random_in_unit_sphere(SamplerPCG32 & rng)
 {
-    // Shio: Efficient uniform mapping from unit square to sphere interior
-    // using low discrepancy floats
-    float u1 = rng.next_1d(sample_idx, dimension + 0);
-    float u2 = rng.next_1d(sample_idx, dimension + 1);
-    float u3 = rng.next_1d(sample_idx, dimension + 2);
+    // Shio: Efficient uniform mapping from unit cube to sphere interior
+    // using purely uncorrelated PCG32 to avoid multi-dimensional structural artifacts.
+    float u1 = rng.next_float();
+    float u2 = rng.next_float();
+    float u3 = rng.next_float();
     
     float z = 1.0f - 2.0f * u1;
     float r = std::sqrt(std::max(0.0f, 1.0f - z * z));
@@ -1144,8 +1134,7 @@ struct SystemEvaluateTranslucent
                 }
                 
                 if (mat.roughness > 0.0f) {
-                    uint32_t sample_idx = state.sample_index + state.rng.next_u32(); 
-                    scatter_dir = scatter_dir + random_in_unit_sphere(state.rng, sample_idx, state.depth * 3) * mat.roughness;
+                    scatter_dir = scatter_dir + random_in_unit_sphere(state.rng) * mat.roughness;
                 }
                 
                 scatter_dir = scatter_dir.normalize();
@@ -1222,9 +1211,10 @@ struct SystemEvaluateLambert
                 ONB onb;
                 onb.build_from_w(hit.normal);
                 
-                uint32_t sample_idx = state.sample_index + state.rng.next_u32(); // Add some extra temporal shuffling
-                float u1 = state.rng.next_1d(sample_idx, state.depth * 2 + 0);
-                float u2 = state.rng.next_1d(sample_idx, state.depth * 2 + 1);
+                // Shio: Independent PCG32 samples correctly map to uniform points 
+                // in the 2D domain without Weyl sequence correlation patterns.
+                float u1 = state.rng.next_float();
+                float u2 = state.rng.next_float();
                 
                 Vector3f scatter_dir = onb.local(cosine_sample_hemisphere(u1, u2));
 
@@ -1300,8 +1290,7 @@ struct SystemEvaluateMetal
                 Vector3f target = reflected;
                 
                 if(mat.roughness > 0.0f) {
-                    uint32_t sample_idx = state.sample_index + state.rng.next_u32(); 
-                    target = target + random_in_unit_sphere(state.rng, sample_idx, state.depth * 3) * mat.roughness;
+                    target = target + random_in_unit_sphere(state.rng) * mat.roughness;
                 }
 
                 if(target.dot(hit.normal) > 0.0f) {
