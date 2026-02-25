@@ -1203,9 +1203,10 @@ struct SystemEvaluateLambert
                 const auto & mat = scene.materials[hit.material_index];
 
                 if (is_cam && cpaths[id].count < MAX_PATH_DEPTH) {
-                    cpaths[id].vertices[cpaths[id].count++] = {hit.point, hit.normal, state.throughput, mat.albedo, false};
+                    // Shio: Store the BRDF value (albedo / PI) in the vertex for the BDPT connector to evaluate!
+                    cpaths[id].vertices[cpaths[id].count++] = {hit.point, hit.normal, state.throughput, mat.albedo * (1.0f / PI), false};
                 } else if (!is_cam && lpaths[id].count < MAX_PATH_DEPTH) {
-                    lpaths[id].vertices[lpaths[id].count++] = {hit.point, hit.normal, state.throughput, mat.albedo, false};
+                    lpaths[id].vertices[lpaths[id].count++] = {hit.point, hit.normal, state.throughput, mat.albedo * (1.0f / PI), false};
                 }
 
                 ONB onb;
@@ -1222,6 +1223,8 @@ struct SystemEvaluateLambert
                 ray.direction = scatter_dir.normalize();
                 ray.t_max     = 1000.0f;
 
+                // Because PDF = cos(theta) / PI and BRDF = albedo / PI, they cancel out exactly
+                // ONLY for the indirect recursive throughput!
                 state.throughput = state.throughput * mat.albedo;
                 state.depth++;
                 state.last_bounce_specular = false;
@@ -1374,6 +1377,7 @@ struct SystemEvaluateLight
                         film.add_sample(state.sample_x, state.sample_y, state.radiance + state.throughput * emission, true);
                     } else {
                         PathVertex path[MAX_PATH_DEPTH + 1];
+                        // Shio: Light source vertices MUST have an effective BRDF of 1.0 (so albedo = PI to cancel the /PI in ConnectPaths).
                         path[0] = {hit.point, hit.normal, {1,1,1}, {PI,PI,PI}, false};
                         for (int j = 0; j < cpath.count; ++j) {
                             path[1 + j] = cpath.vertices[cpath.count - 1 - j];
@@ -1450,8 +1454,8 @@ struct SystemConnectPaths
                         if (ndotl_c > 0.0f && ndotl_l > 0.0f) {
                             if (!scene.intersect(cv.p + cv.n * 0.001f, L, dist - 0.002f)) {
                                 float G = (ndotl_c * ndotl_l) / dist2;
-                                Color3f brdf_c = cv.albedo * (1.0f / PI);
-                                Color3f brdf_l = lv.albedo * (1.0f / PI);
+                                Color3f brdf_c = cv.albedo;
+                                Color3f brdf_l = lv.albedo;
                                 Color3f contrib = cv.beta * brdf_c * G * brdf_l * lv.beta;
                                 
                                 PathVertex path[MAX_PATH_DEPTH * 2];
