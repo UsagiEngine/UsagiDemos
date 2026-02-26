@@ -1,3 +1,57 @@
+/*
+ * Shio:
+ * =============================================================================
+ * Usagi Engine - Data-Oriented Bidirectional Path Tracer (BDPT)
+ * =============================================================================
+ *
+ * File: Raytracer.hpp
+ * 
+ * Logic & Design Decisions:
+ * - This file implements a data-oriented ray tracer based on Bidirectional Path Tracing (BDPT).
+ * - Component-System Architecture (ECS): Instead of recursive function calls which bloat 
+ *   the stack and cause thread starvation, ray tracing is implemented as a state machine.
+ *   Paths are explicitly constructed in memory (ComponentCameraPath, ComponentLightPath) 
+ *   and advanced via systems (SystemGenerateRays, SystemIntersectRays, SystemEvaluateLambert, etc.).
+ * - Materials:
+ *   - Lambert: Perfect diffuse scattering (cosine weighted).
+ *   - Metal: Imperfect mirror reflection.
+ *   - Light: Emissive surfaces (Sun, Moon).
+ *   - Translucent: Schlick's approximation for dielectric reflection/refraction with 
+ *     Beer's Law volumetric absorption.
+ * - Scene Geometry & Acceleration:
+ *   - Primitives: Sphere, Box (AABB).
+ *   - BVH (Bounding Volume Hierarchy): A SAH (Surface Area Heuristic) optimized BVH 
+ *     tree is used to accelerate ray intersection tests from O(N) to O(log N). 
+ *     The optimize_bvh method allows dynamic runtime rebuilds if objects move or are added.
+ * - Frame Accumulation & TAA (Temporal Anti-Aliasing):
+ *   - ServiceFilm acts as a thread-safe framebuffer.
+ *   - Exponential Moving Average (EMA) with a motion-blurred ghost buffer.
+ *   - Mitchell-Netravali filtering to mitigate high-frequency noise.
+ *   - ACES Filmic Tone Mapping Curve prevents blowout from HDR sources.
+ *
+ * Caveats & Technical Information:
+ * - Direct light samples bypass the MIS (Multiple Importance Sampling) and go straight 
+ *   to the direct buffer for crisp, noise-free highlights.
+ * - Indirect light paths (bounced) undergo MIS weighted combinations.
+ * - SamplerPCG32 provides statistically uncorrelated PRNG streams, coupled with 
+ *   Halton/Radical Inverse sequences to achieve low-discrepancy initial rays.
+ *
+ * Development History & Experiments (Git Log Summary):
+ * - Initial versions used standard recursive ray tracing (experimental ray tracing test).
+ * - Refactored to a DOD (Data-Oriented Design) system using task graphs to maximize CPU 
+ *   occupancy (shio: data parallelism, shio: handle recursive ray queries).
+ * - Transitioned from Unidirectional Path Tracing to Bidirectional Path Tracing (BDPT)
+ *   to correctly resolve complex caustics and light transport (basic bidirectional path tracing).
+ * - Introduced Translucent material type with subsurface scattering (SSS) approximations.
+ * - Switched to Sparse Rendering (sparse rendering to maintain fps) dynamically adjusting 
+ *   the ray_budget depending on frame time to ensure a fluid user experience even during heavy movement.
+ * - Applied frequency-domain spatial filtering to suppress variance spikes/fireflies.
+ * - Integrated celestial bodies (Sun, Moon) with physically-based atmospheric scattering (Rayleigh/Mie)
+ *   acting as volumetric light filters rather than arbitrary colored spheres.
+ * - Procedural "Minecraft-style" terrain generation created complex multi-primitive environments
+ *   necessitating the implementation of a BVH (Bounding Volume Hierarchy) (add scene bvh, Add bvh optimization).
+ * =============================================================================
+ */
 #pragma once
 
 #include <algorithm>
@@ -168,6 +222,8 @@ inline Vector3f random_in_unit_sphere(SamplerPCG32 & rng)
 {
     // Shio: Efficient uniform mapping from unit cube to sphere interior
     // using purely uncorrelated PCG32 to avoid multi-dimensional structural artifacts.
+    // Instead of rejection sampling (which has non-deterministic loop times and branch mispredictions),
+    // we use spherical coordinates and a cubic root scale to guarantee O(1) execution.
     float u1 = rng.next_float();
     float u2 = rng.next_float();
     float u3 = rng.next_float();
@@ -644,6 +700,9 @@ struct ServiceFilm
     }
 
     void apply_ema_decay(double decay_factor, double expired_decay = 0.5) {
+        // Shio: TAA (Temporal Anti-Aliasing) Double Buffer Logic.
+        // 'decay_factor' dictates how much history we keep. 1.0 = keep all (infinite accumulation).
+        // 0.85 = typical standing decay (smooths noise, keeps shadows responsive).
         for(auto& p : pixels) {
             auto atomic_scale = [](std::atomic<double>& target, double factor) {
                 double old = target.load(std::memory_order_relaxed);
@@ -758,6 +817,9 @@ struct ServiceScene
             float best_split_pos = 0.0f;
             const int BINS = 8;
             
+            // Shio: Surface Area Heuristic (SAH). Instead of picking the median primitive, 
+            // we evaluate the probability of a random ray hitting the left vs right child nodes.
+            // We approximate the continuous space by slicing the bounding box into 8 discrete bins.
             for (int axis = 0; axis < 3; ++axis) {
                 float min_centroid = 1e30f;
                 float max_centroid = -1e30f;
@@ -978,6 +1040,8 @@ struct ServiceScene
             int node_idx = stack[--stack_ptr];
             const auto& node = bvh_nodes[node_idx];
 
+            // Shio: Fast AABB intersection test. If the ray completely misses this node's bounding box,
+            // we prune the entire sub-tree, accelerating traversal from O(n) to O(log n).
             if (!node.bounds.intersect(o, inv_d, 0.001f, rec.t)) {
                 continue;
             }
@@ -2097,3 +2161,4 @@ struct SystemRenderGDICanvas
 };
 
 } // namespace RT
+

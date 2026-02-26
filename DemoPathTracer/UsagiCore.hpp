@@ -1,3 +1,47 @@
+/*
+ * Shio:
+ * =============================================================================
+ * Usagi Engine - Core Architecture & Memory Management Layer
+ * =============================================================================
+ *
+ * File: UsagiCore.hpp
+ *
+ * Logic & Design Decisions:
+ * - Direct NT Kernel Memory Allocation: 
+ *   Instead of relying on the standard Win32 Heap/VirtualAlloc APIs, Usagi Engine 
+ *   uses undocumented NT APIs (NtCreateSection, NtMapViewOfSection).
+ *   This allows the allocation of massive virtual address spaces (e.g., 2GB+ MappedHeap)
+ *   backed directly by the Windows pagefile with extremely low overhead.
+ * - Position-Independent Data (PIC):
+ *   To support seamless serialization, hot-reloading, or inter-process shared memory in the future,
+ *   the ECS heavily utilizes Handle<T> rather than raw pointers (T*). A Handle is 
+ *   a simple 32-bit offset relative to the heap's base address.
+ * - Entity-Component-System (ECS) Layer:
+ *   - ComponentGroup: Stores components in strictly contiguous SoA (Structure of Arrays) layouts.
+ *   - Adheres strictly to Data-Oriented Design (DOD). Systems request arrays of components 
+ *     and iterate linearly, perfectly utilizing CPU cache lines.
+ * - Service Locator:
+ *   - Services acts as a highly optimized, type-safe global registry. It uses 
+ *     compile-time type ID generation (next_id.fetch_add(1)) for O(1) array lookups, 
+ *     eliminating the need for virtual calls or string-based dictionary lookups.
+ * - Task Graph Executor:
+ *   - The Executive defines the interface for a topological dependency graph scheduler 
+ *     that resolves read/write dependencies between Systems, enabling lock-free 
+ *     parallel execution. (Fully implemented in Executive.hpp).
+ *
+ * Caveats & Technical Information:
+ * - Bypassing Win32 for NTAPI introduces platform dependence on the internal Windows Kernel ABI.
+ *   While stable across modern Windows NT versions, it requires linking against ntdll.lib.
+ * - The MappedHeap currently acts as a linear bump-allocator without defragmentation.
+ *   Entity deletion leaves "holes" unless explicit compaction logic is added to systems.
+ *
+ * Development History & Experiments (Git Log Summary):
+ * - Core structural foundation that enabled the transition from recursive OOP ray tracing
+ *   to iterative, system-based Data-Oriented path tracing.
+ * - Memory bounds were dynamically expanded (to 2GB+) specifically to handle 
+ *   Bidirectional Path Tracing (BDPT) path vertex arrays for dense pixel counts.
+ * =============================================================================
+ */
 #pragma once
 
 #include <atomic>
@@ -182,6 +226,9 @@ public:
     template <typename T>
     Handle<T> allocate_pod(size_t count = 1)
     {
+        // Shio: Lock-free bump pointer allocation. Extremely fast, but we cannot free individual 
+        // components. If entities are destroyed, their memory remains "allocated" as a hole 
+        // until a compaction system defragments the heap (not currently implemented).
         size_t alloc_size = sizeof(T) * count;
         size_t offset     = current_offset.fetch_add(alloc_size);
         if(offset + alloc_size > total_size) return { 0xFFFF'FFFF }; // OOM
@@ -251,10 +298,13 @@ public:
         return [this](auto && func) {
             size_t current_count = count.load();
             // Resolve pointers for requested component types once per query
+            // Shio: We resolve all SoA (Structure of Arrays) base pointers upfront.
             auto   tuple_of_pointers =
                 std::make_tuple(this->get_array<QueryTypes>()...);
 
             // Linear iteration over the contiguous arrays
+            // Shio: The CPU prefetcher will aggressively load these contiguous arrays into L1/L2 cache,
+            // practically eliminating cache misses during the system update loops.
             for(size_t i = 0; i < current_count; ++i)
             {
                 // Invoke the system lambda with references to the components
@@ -333,3 +383,4 @@ public:
 };
 
 } // namespace Usagi
+

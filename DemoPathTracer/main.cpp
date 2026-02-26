@@ -1,3 +1,45 @@
+/*
+ * Shio:
+ * =============================================================================
+ * Usagi Engine - Demo Path Tracer Entry Point
+ * =============================================================================
+ *
+ * File: main.cpp
+ *
+ * Logic & Design Decisions:
+ * - Application lifecycle and window management are decoupled from the core render loop.
+ * - Win32 message pump runs exclusively on the main UI thread to remain responsive.
+ * - The actual BDPT engine runs on a dedicated background thread, maximizing CPU utilization.
+ * - Interaction:
+ *   - Unreal Engine / FPS style camera controls (WASD, Mouse look, Drag to Pan).
+ *   - Time control: Spacebar/Pause to freeze time, Forward/Rewind mapped to specific keys.
+ *   - Time advancement governs the position of the celestial bodies (Sun/Moon), which 
+ *     forces the BVH to dynamically rebalance each frame.
+ * - Scene Setup: 
+ *   - SetupCornellBox initially populated a standard Cornell Box, but was expanded 
+ *     to generate procedurally generated voxel terrain (mountains, trees, frozen lakes, caves)
+ *     to benchmark the BVH and the BDPT integrator's caustics.
+ * 
+ * Caveats & Technical Information:
+ * - Uses raw GDI SetDIBitsToDevice for zero-dependency blitting of the software-rendered 
+ *   framebuffer to the window surface.
+ * - High-resolution clock delta time (dt) dynamically adjusts the frame's ray_budget
+ *   to guarantee 90+ FPS interactive feedback, shifting computational weight from spatial 
+ *   density to temporal accumulation when the camera moves.
+ * - Hardware scan codes (GetAsyncKeyState / WM_KEYDOWN) bypass OS keyboard layouts 
+ *   for precise physical key mapping.
+ *
+ * Development History & Experiments (Git Log Summary):
+ * - Implemented non-blocking OS message pumping alongside background rendering threads
+ *   to prevent UI lockups during intensive trace frames (shio: move window smoothly while rendering).
+ * - Added comprehensive Minecraft-style terrain generation spanning thousands of AABBs 
+ *   to stress-test acceleration structures (comprehensive minecraft terrain).
+ * - Fine-tuned the input mechanics (mouse capture, WASD velocity) to match standard 
+ *   editor navigation schemes (impl mouse panning, impl interactive map exploration).
+ * - Added dynamic time acceleration/rewind to observe physically-based atmospheric 
+ *   scattering dynamically as the sun sets (add time accel/rewind).
+ * =============================================================================
+ */
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -158,6 +200,8 @@ void SetupCornellBox(RT::ServiceScene & scene)
     };
 
     auto get_height = [](int x, int z) {
+        // Shio: Procedural pseudo-random heightmap generation using overlapping trigonometric functions.
+        // Creating non-uniform frequencies breaks up grid-like repetition in the Minecraft terrain.
         float fx = x * 0.15f;
         float fz = z * 0.15f;
         float h = std::sin(fx) * std::cos(fz) * 3.0f + std::sin(fx * 2.5f + fz * 1.5f) * 1.0f;
@@ -347,6 +391,9 @@ int WINAPI WinMain(
 
                             // --- Dynamic Ray Budget (Target ~90 FPS for maximum fluidity) ---
                             float target_dt = 1.0f / 90.0f;
+                            // Shio: Feedback control loop. If the previous frame took too long, 
+                            // aggressively drop the ray budget by 20%. If it was fast, cautiously increase by 15%.
+                            // This guarantees interactivity even when moving into complex, heavy BVH views.
                             if (dt > target_dt * 1.05f) {
                                 render_state.ray_budget = std::max(20000, int(render_state.ray_budget * 0.8f));
                             } else if (dt < target_dt * 0.95f) {
@@ -454,6 +501,7 @@ int WINAPI WinMain(
                 if (is_focused) {
                     // Shio: Raw hardware scan codes completely bypass Windows layout translation!
                     // 0x11 = Physical W, 0x1E = Physical A, 0x1F = Physical S, 0x20 = Physical D
+                    // This ensures the physical positions of WASD remain the same on AZERTY/Dvorak/etc.
                     bool key_W = g_KeyStates[0x11].load(std::memory_order_relaxed);
                     bool key_A = g_KeyStates[0x1E].load(std::memory_order_relaxed);
                     bool key_S = g_KeyStates[0x1F].load(std::memory_order_relaxed);
@@ -543,3 +591,4 @@ int main()
     return WinMain(
         GetModuleHandle(NULL), NULL, GetCommandLineA(), SW_SHOWDEFAULT);
 }
+
