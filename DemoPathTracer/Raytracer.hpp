@@ -360,6 +360,12 @@ struct AABB {
 
     Vector3f center() const { return (min + max) * 0.5f; }
 
+    float surface_area() const {
+        Vector3f d = max - min;
+        if (d.x < 0.0f || d.y < 0.0f || d.z < 0.0f) return 0.0f;
+        return 2.0f * (d.x * d.y + d.x * d.z + d.y * d.z);
+    }
+
     bool intersect(const Vector3f & o, const Vector3f & inv_d, float t_min, float t_max) const {
         float t0 = -1e30f;
         float t1 = 1e30f;
@@ -503,7 +509,7 @@ struct ServiceCamera
 struct ServiceTime
 {
     float current_time = 0.0f;
-    bool is_paused = false;
+    bool is_paused = true;
 };
 
 /*
@@ -710,78 +716,136 @@ struct ServiceScene
     std::vector<PrimRef> bvh_prims;
     std::vector<BVHNode> bvh_nodes;
 
-    // Shio: Build BVH from scratch using a simple median split over longest axis.
-    void build_bvh() {
-        bvh_prims.clear();
-        for (int i = 0; i < spheres.size(); ++i) {
-            AABB b;
-            b.expand(spheres[i].center - Vector3f{spheres[i].radius, spheres[i].radius, spheres[i].radius});
-            b.expand(spheres[i].center + Vector3f{spheres[i].radius, spheres[i].radius, spheres[i].radius});
-            bvh_prims.push_back({0, i, b});
-        }
-        for (int i = 0; i < boxes.size(); ++i) {
-            AABB b;
-            b.expand(boxes[i].min);
-            b.expand(boxes[i].max);
-            bvh_prims.push_back({1, i, b});
-        }
-        
-        bvh_nodes.clear();
-        if (bvh_prims.empty()) return;
-
-        bvh_nodes.emplace_back();
-        subdivide_bvh(0, 0, bvh_prims.size());
-    }
-
-    void subdivide_bvh(int node_idx, int first, int count) {
-        auto& node = bvh_nodes[node_idx];
-        node.first_prim = first;
-        node.prim_count = count;
-        
-        for (int i = 0; i < count; ++i) {
-            node.bounds.expand(bvh_prims[first + i].bounds);
-        }
-        
-        if (count <= 4) return; // Leaf threshold
-        
-        Vector3f extent = node.bounds.max - node.bounds.min;
-        int axis = 0;
-        if (extent.y > extent.x && extent.y > extent.z) axis = 1;
-        else if (extent.z > extent.x && extent.z > extent.y) axis = 2;
-        
-        float split_pos = node.bounds.min[axis] + extent[axis] * 0.5f;
-        
-        int i = first;
-        int j = first + count - 1;
-        while (i <= j) {
-            if (bvh_prims[i].bounds.center()[axis] < split_pos) {
-                i++;
-            } else {
-                std::swap(bvh_prims[i], bvh_prims[j]);
-                j--;
+        // Shio: Rebalance and optimize the BVH using a Surface Area Heuristic (SAH) build.
+        // This optimization method can be called dynamically at runtime if new objects
+        // are added or if existing objects have moved significantly to rebalance the tree.
+        void optimize_bvh() {
+            bvh_prims.clear();
+            for (int i = 0; i < spheres.size(); ++i) {
+                AABB b;
+                b.expand(spheres[i].center - Vector3f{spheres[i].radius, spheres[i].radius, spheres[i].radius});
+                b.expand(spheres[i].center + Vector3f{spheres[i].radius, spheres[i].radius, spheres[i].radius});
+                bvh_prims.push_back({0, i, b});
             }
+            for (int i = 0; i < boxes.size(); ++i) {
+                AABB b;
+                b.expand(boxes[i].min);
+                b.expand(boxes[i].max);
+                bvh_prims.push_back({1, i, b});
+            }
+            
+            bvh_nodes.clear();
+            if (bvh_prims.empty()) return;
+    
+            bvh_nodes.emplace_back();
+            subdivide_bvh_sah(0, 0, bvh_prims.size());
         }
-        
-        int left_count = i - first;
-        if (left_count == 0 || left_count == count) {
-            left_count = count / 2;
-        }
-        
-        int left_child_idx = bvh_nodes.size();
-        bvh_nodes.emplace_back();
-        int right_child_idx = bvh_nodes.size();
-        bvh_nodes.emplace_back();
-        
-        bvh_nodes[node_idx].left_child = left_child_idx;
-        bvh_nodes[node_idx].right_child = right_child_idx;
-        bvh_nodes[node_idx].prim_count = 0; // Internal node
-        
-        subdivide_bvh(left_child_idx, first, left_count);
-        subdivide_bvh(right_child_idx, first + left_count, count - left_count);
-    }
-
-    Color3f evaluate_emission(const Material& mat, const Vector3f& p, const Vector3f& center) const {
-        if (!mat.is_moon) return mat.emission;
+    
+        void subdivide_bvh_sah(int node_idx, int first, int count) {
+            auto& node = bvh_nodes[node_idx];
+            node.first_prim = first;
+            node.prim_count = count;
+            
+            for (int i = 0; i < count; ++i) {
+                node.bounds.expand(bvh_prims[first + i].bounds);
+            }
+            
+            if (count <= 2) return; // Leaf threshold
+            
+            // Find best split using SAH
+            float best_cost = 1e30f;
+            int best_axis = -1;
+            float best_split_pos = 0.0f;
+            const int BINS = 8;
+            
+            for (int axis = 0; axis < 3; ++axis) {
+                float min_centroid = 1e30f;
+                float max_centroid = -1e30f;
+                for (int i = 0; i < count; ++i) {
+                    float c = bvh_prims[first + i].bounds.center()[axis];
+                    min_centroid = std::min(min_centroid, c);
+                    max_centroid = std::max(max_centroid, c);
+                }
+                
+                if (min_centroid == max_centroid) continue;
+                
+                struct Bin {
+                    AABB bounds;
+                    int count = 0;
+                } bins[BINS];
+                
+                float scale = BINS / (max_centroid - min_centroid);
+                for (int i = 0; i < count; ++i) {
+                    float c = bvh_prims[first + i].bounds.center()[axis];
+                    int bin_idx = std::min(BINS - 1, std::max(0, (int)((c - min_centroid) * scale)));
+                    if (bin_idx == BINS) bin_idx = BINS - 1; // Safeguard against floating point rounding
+                    bins[bin_idx].bounds.expand(bvh_prims[first + i].bounds);
+                    bins[bin_idx].count++;
+                }
+                
+                float left_area[BINS - 1];
+                int left_count[BINS - 1];
+                AABB left_box;
+                int sum_count = 0;
+                for (int i = 0; i < BINS - 1; ++i) {
+                    left_box.expand(bins[i].bounds);
+                    sum_count += bins[i].count;
+                    left_area[i] = left_box.surface_area();
+                    left_count[i] = sum_count;
+                }
+                
+                AABB right_box;
+                sum_count = 0;
+                for (int i = BINS - 1; i > 0; --i) {
+                    right_box.expand(bins[i].bounds);
+                    sum_count += bins[i].count;
+                    
+                    float cost = left_count[i - 1] * left_area[i - 1] + sum_count * right_box.surface_area();
+                    if (cost < best_cost) {
+                        best_cost = cost;
+                        best_axis = axis;
+                        best_split_pos = min_centroid + i * (max_centroid - min_centroid) / BINS;
+                    }
+                }
+            }
+            
+            float node_area = node.bounds.surface_area();
+            float leaf_cost = count * node_area;
+            
+            if (best_cost >= leaf_cost || best_axis == -1) {
+                return; // Create leaf
+            }
+            
+            int i = first;
+            int j = first + count - 1;
+            while (i <= j) {
+                if (bvh_prims[i].bounds.center()[best_axis] < best_split_pos) {
+                    i++;
+                } else {
+                    std::swap(bvh_prims[i], bvh_prims[j]);
+                    j--;
+                }
+            }
+            
+            int left_count = i - first;
+            if (left_count == 0 || left_count == count) {
+                left_count = count / 2;
+            }
+            
+            int left_child_idx = bvh_nodes.size();
+            bvh_nodes.emplace_back();
+            int right_child_idx = bvh_nodes.size();
+            bvh_nodes.emplace_back();
+            
+                    bvh_nodes[node_idx].left_child = left_child_idx;
+                    bvh_nodes[node_idx].right_child = right_child_idx;
+                    bvh_nodes[node_idx].prim_count = 0; // Internal node
+                    
+                    subdivide_bvh_sah(left_child_idx, first, left_count);
+                    subdivide_bvh_sah(right_child_idx, first + left_count, count - left_count);
+                }
+            
+                Color3f evaluate_emission(const Material& mat, const Vector3f& p, const Vector3f& center) const {        if (!mat.is_moon) return mat.emission;
         
         // Procedural craters/surface noise
         Vector3f local = (p - center).normalize();
@@ -1812,7 +1876,7 @@ struct SystemPathTracingCoordinator
                 }
             }
 
-            scene.build_bvh(); // Shio: Rebuild BVH as dynamic objects have moved!
+            scene.optimize_bvh(); // Shio: Rebalance and optimize BVH as dynamic objects have moved!
 
             SystemGenerateRays sys_gen;
             sys_gen.update(entities, services);
