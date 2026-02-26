@@ -32,7 +32,7 @@ class TaskGraphExecutionHost
         std::vector<size_t>   write_deps;
         std::vector<size_t>   read_deps;
         std::vector<size_t>   dependents;
-        size_t                initial_dependencies    = 0;
+        size_t                initial_dependencies = 0;
         std::atomic<size_t>   unresolved_dependencies { 0 };
     };
 
@@ -102,7 +102,8 @@ class TaskGraphExecutionHost
             std::function<void()> task;
             {
                 std::unique_lock<std::mutex> lock(task_mutex);
-                task_cv.wait(lock, [this] { return !task_queue.empty() || !running; });
+                task_cv.wait(
+                    lock, [this] { return !task_queue.empty() || !running; });
 
                 if(!running && task_queue.empty()) return;
 
@@ -122,7 +123,8 @@ class TaskGraphExecutionHost
             if(nodes[dep_index].unresolved_dependencies.fetch_sub(1) == 1)
             {
                 std::lock_guard<std::mutex> lock(task_mutex);
-                task_queue.push_back([this, dep_index]() { execute_node(dep_index); });
+                task_queue.push_back(
+                    [this, dep_index]() { execute_node(dep_index); });
                 task_cv.notify_one();
             }
         }
@@ -156,7 +158,7 @@ public:
     template <typename System, typename Entities, typename Services>
     void register_system(System & sys, Entities & entities, Services & services)
     {
-        auto & node = nodes.emplace_back();
+        auto & node       = nodes.emplace_back();
         node.execute_func = [&sys, &entities, &services]() {
             sys.update(entities, services);
         };
@@ -180,8 +182,12 @@ public:
 
                 for(size_t j_write : nodes[j].write_deps)
                 {
-                    if(std::find(nodes[i].write_deps.begin(), nodes[i].write_deps.end(), j_write) != nodes[i].write_deps.end() ||
-                       std::find(nodes[i].read_deps.begin(), nodes[i].read_deps.end(), j_write) != nodes[i].read_deps.end())
+                    if(std::find(nodes[i].write_deps.begin(),
+                           nodes[i].write_deps.end(),
+                           j_write) != nodes[i].write_deps.end() ||
+                        std::find(nodes[i].read_deps.begin(),
+                            nodes[i].read_deps.end(),
+                            j_write) != nodes[i].read_deps.end())
                     {
                         conflict = true;
                         break;
@@ -192,7 +198,9 @@ public:
                 {
                     for(size_t j_read : nodes[j].read_deps)
                     {
-                        if(std::find(nodes[i].write_deps.begin(), nodes[i].write_deps.end(), j_read) != nodes[i].write_deps.end())
+                        if(std::find(nodes[i].write_deps.begin(),
+                               nodes[i].write_deps.end(),
+                               j_read) != nodes[i].write_deps.end())
                         {
                             conflict = true;
                             break;
@@ -217,23 +225,25 @@ public:
 
     /*
      * Shio: Distributes data-parallel work across the worker thread pool.
-     * Blocks the caller until all chunks complete, actively helping to drain the task queue
-     * to avoid deadlocks and maximize throughput.
+     * Blocks the caller until all chunks complete, actively helping to drain
+     * the task queue to avoid deadlocks and maximize throughput.
      */
     template <typename F>
     void parallel_for(size_t count, size_t chunk_size, F && func)
     {
         if(count == 0) return;
-        
-        // Shio: Dynamically override the passed chunk_size to guarantee 100% 32-core occupancy 
-        // even when processing extremely small sparse-ray counts!
-        size_t hardware_threads = std::max<size_t>(1, std::thread::hardware_concurrency());
+
+        // Shio: Dynamically override the passed chunk_size to guarantee 100%
+        // 32-core occupancy even when processing extremely small sparse-ray
+        // counts!
+        size_t hardware_threads =
+            std::max<size_t>(1, std::thread::hardware_concurrency());
         chunk_size = std::max<size_t>(1, count / (hardware_threads * 4));
-        
+
         size_t num_chunks = (count + chunk_size - 1) / chunk_size;
 
         std::atomic<size_t> next_chunk { 0 };
-        size_t pushed_tasks = std::min(num_chunks, workers.size());
+        size_t              pushed_tasks = std::min(num_chunks, workers.size());
         std::atomic<size_t> active_tasks { pushed_tasks };
 
         auto worker_func = [&]() {
@@ -282,8 +292,10 @@ public:
                     task_queue.pop_front();
                 }
             }
-            if(stolen_task) stolen_task();
-            else std::this_thread::yield();
+            if(stolen_task)
+                stolen_task();
+            else
+                std::this_thread::yield();
         }
     }
 
@@ -297,7 +309,8 @@ public:
             std::lock_guard<std::mutex> lock(task_mutex);
             for(size_t i = 0; i < nodes.size(); ++i)
             {
-                nodes[i].unresolved_dependencies = nodes[i].initial_dependencies;
+                nodes[i].unresolved_dependencies =
+                    nodes[i].initial_dependencies;
                 if(nodes[i].initial_dependencies == 0)
                 {
                     task_queue.push_back([this, i]() { execute_node(i); });
@@ -309,7 +322,8 @@ public:
 
         {
             std::unique_lock<std::mutex> lock(completion_mutex);
-            completion_cv.wait(lock, [this] { return completed_nodes == nodes.size(); });
+            completion_cv.wait(
+                lock, [this] { return completed_nodes == nodes.size(); });
         }
 
         while(true)
